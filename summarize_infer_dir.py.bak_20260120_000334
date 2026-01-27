@@ -1,0 +1,143 @@
+import os
+import glob
+import numpy as np
+try:
+    import cv2
+    _HAVE_CV2 = True
+except Exception:
+    cv2 = None
+    _HAVE_CV2 = False
+    from PIL import Image
+
+
+def _read_image(path):
+    if _HAVE_CV2:
+        img = cv2.imread(path, cv2.IMREAD_COLOR)
+        if img is None:
+            raise FileNotFoundError(f"failed to read image: {path}")
+        return img
+    img = Image.open(path).convert("RGB")
+    arr = np.array(img)
+    return arr[:, :, ::-1]  # RGB -> BGR to match cv2
+
+
+def _bgr_to_gray(img_bgr):
+    img = img_bgr.astype(np.float32)
+    b = img[..., 0]
+    g = img[..., 1]
+    r = img[..., 2]
+    return 0.114 * b + 0.587 * g + 0.299 * r
+
+
+def _gaussian_kernel_1d(ksize=11, sigma=1.5):
+    ax = np.arange(ksize) - (ksize - 1) / 2.0
+    k = np.exp(-(ax ** 2) / (2.0 * sigma ** 2))
+    k = k / np.sum(k)
+    return k.astype(np.float32)
+
+
+def _gaussian_blur_gray(x, ksize=11, sigma=1.5):
+    k = _gaussian_kernel_1d(ksize, sigma)
+    pad = ksize // 2
+    x_pad = np.pad(x, ((0, 0), (pad, pad)), mode="reflect")
+    tmp = np.apply_along_axis(
+        lambda m: np.convolve(m, k, mode="valid"), axis=1, arr=x_pad
+    )
+    x_pad = np.pad(tmp, ((pad, pad), (0, 0)), mode="reflect")
+    out = np.apply_along_axis(
+        lambda m: np.convolve(m, k, mode="valid"), axis=0, arr=x_pad
+    )
+    return out
+
+
+def split_pred_tgt_from_cat(img):
+    # img: HxWx3, cat panels
+    W = img.shape[1]
+    if W % 3 == 0:
+        w = W // 3
+        pred = img[:, w:2 * w]
+        tgt = img[:, 2 * w:3 * w]
+        mode = "3panel"
+    elif W % 2 == 0:
+        w = W // 2
+        pred = img[:, 0:w]
+        tgt = img[:, w:2 * w]
+        mode = "2panel"
+    else:
+        w = W // 3
+        pred = img[:, w:2 * w]
+        tgt = img[:, 2 * w:3 * w]
+        mode = "fallback3"
+    return pred, tgt, mode
+
+
+def psnr(x, y, eps=1e-8):
+    mse = np.mean((x - y) ** 2)
+    if mse < eps:
+        return 99.0
+    return 10.0 * np.log10(1.0 / mse)
+
+
+def ssim_simple(x, y, eps=1e-6):
+    # very simple SSIM on luminance, not perfect but useful
+    if _HAVE_CV2:
+        x = cv2.cvtColor((x * 255).astype(np.uint8),
+                         cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+        y = cv2.cvtColor((y * 255).astype(np.uint8),
+                         cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+        mu_x = cv2.GaussianBlur(x, (11, 11), 1.5)
+        mu_y = cv2.GaussianBlur(y, (11, 11), 1.5)
+        sigma_x = cv2.GaussianBlur(x * x, (11, 11), 1.5) - mu_x * mu_x
+        sigma_y = cv2.GaussianBlur(y * y, (11, 11), 1.5) - mu_y * mu_y
+        sigma_xy = cv2.GaussianBlur(x * y, (11, 11), 1.5) - mu_x * mu_y
+    else:
+        x = _bgr_to_gray(x)
+        y = _bgr_to_gray(y)
+        mu_x = _gaussian_blur_gray(x, 11, 1.5)
+        mu_y = _gaussian_blur_gray(y, 11, 1.5)
+        sigma_x = _gaussian_blur_gray(x * x, 11, 1.5) - mu_x * mu_x
+        sigma_y = _gaussian_blur_gray(y * y, 11, 1.5) - mu_y * mu_y
+        sigma_xy = _gaussian_blur_gray(x * y, 11, 1.5) - mu_x * mu_y
+    C1, C2 = 0.01**2, 0.03**2
+    num = (2*mu_x*mu_y + C1) * (2*sigma_xy + C2)
+    den = (mu_x*mu_x + mu_y*mu_y + C1) * (sigma_x + sigma_y + C2)
+    return float(np.mean(num / (den + eps)))
+
+
+def main(out_dir):
+    cat_paths = sorted(glob.glob(os.path.join(
+        out_dir, "*_cat_pred_tgt_step*.png")))
+    cat_paths = [
+        p for p in cat_paths
+        if ("_mask_" not in os.path.basename(p)
+            and "_conf_" not in os.path.basename(p)
+            and "_p0" not in os.path.basename(p)
+            and "_p1" not in os.path.basename(p)
+            and "_p2" not in os.path.basename(p))
+    ]
+
+    rows = []
+    for p in cat_paths:
+        step = os.path.basename(p).split("_step")[-1].split(".")[0]
+        img = _read_image(p)
+        pred_vis, tgt_vis, mode = split_pred_tgt_from_cat(img)
+
+        pred = pred_vis.astype(np.float32) / 255.0
+        tgt = tgt_vis.astype(np.float32) / 255.0
+
+        l1 = float(np.mean(np.abs(pred - tgt)))
+        p_all = psnr(pred, tgt)
+        s_all = ssim_simple(pred, tgt)
+        rows.append((step, l1, p_all, s_all, mode))
+
+    rows = sorted(rows, key=lambda x: x[1], reverse=True)
+    print(f"found {len(rows)} frames from {out_dir}")
+    print("step	L1	PSNR	SSIM	panel_mode")
+    for r in rows[:20]:
+        print(f"{r[0]}	{r[1]:.4f}	{r[2]:.2f}	{r[3]:.4f}	{r[4]}")
+
+
+if __name__ == "__main__":
+
+    import sys
+    main(sys.argv[1] if len(sys.argv) > 1 else "infer_vis/val_e104")

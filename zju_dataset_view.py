@@ -1,0 +1,306 @@
+# zju_dataset_view.py
+import os
+import os.path as osp
+import numpy as np
+from PIL import Image
+
+import torch
+from torch.utils.data import Dataset
+import torchvision.transforms.functional as TF
+
+
+class ZJUViewSynthDataset(Dataset):
+    def __init__(
+        self,
+        root,
+        seq_names,
+        num_src_views=3,
+        frame_subsample=1,
+        split=None,                # None / "train" / "val" / "test"
+        train_ratio=0.9,
+        split_seed=0,
+        deterministic_views=False,  # True 时每个样本固定 src/tgt 选法（val/test 建议 True）
+        view_seed=2025,
+    ):
+        """
+        读取 precompute_zju_vggt_geom.py 生成的 npz（vggt_geom/*.npz）
+        每个样本：随机选 1 个 tgt 视角 + num_src_views 个 src 视角
+
+        split:
+          - None: 使用所有帧（你也可以外部 random_split）
+          - "train"/"val"/"test": 内部按 train_ratio 切分（val/test 用同一份后半段）
+        """
+        self.root = root
+        self.seq_names = list(seq_names)
+        self.num_src_views = int(num_src_views)
+        self.frame_subsample = int(frame_subsample)
+        self.split = split
+        self.train_ratio = float(train_ratio)
+        self.split_seed = int(split_seed)
+
+        self.deterministic_views = bool(deterministic_views)
+        self.view_seed = int(view_seed)
+        self.num_views = 0
+        self.num_views_by_seq = {}
+        self.cam_name_to_id = {}
+        self.cam_names = []
+
+        # --- 收集所有帧（all samples） ---
+        all_samples = []
+        global_idx = 0
+        for seq in self.seq_names:
+            geom_dir = osp.join(root, seq, "vggt_geom")
+            if not osp.isdir(geom_dir):
+                raise FileNotFoundError(
+                    f"[ZJUViewSynthDataset] geom dir not found: {geom_dir}")
+
+            frame_files = sorted(f for f in os.listdir(
+                geom_dir) if f.endswith(".npz"))
+            if frame_files:
+                first_path = osp.join(geom_dir, frame_files[0])
+                try:
+                    with np.load(first_path, allow_pickle=True) as data:
+                        img_paths = data["img_paths"]
+                        v = int(img_paths.shape[0])
+                        cam_names = data["cam_names"] if "cam_names" in data else None
+                        if cam_names is not None:
+                            cam_names = [self._decode_cam_name(
+                                n) for n in cam_names]
+                            for name in cam_names:
+                                if name not in self.cam_name_to_id:
+                                    self.cam_name_to_id[name] = len(
+                                        self.cam_name_to_id)
+                                    self.cam_names.append(name)
+                            v = len(cam_names)
+                except Exception:
+                    v = 0
+                self.num_views_by_seq[seq] = v
+                if v > self.num_views:
+                    self.num_views = v
+            for fname in frame_files[:: self.frame_subsample]:
+                geom_path = osp.join(geom_dir, fname)
+                all_samples.append(
+                    dict(
+                        seq=seq,
+                        geom_path=geom_path,
+                        global_idx=global_idx,   # 用于 deterministic_views 的稳定 seed
+                    )
+                )
+                global_idx += 1
+
+        # --- split 划分 ---
+        if split is None:
+            self.samples = all_samples
+        else:
+            rng = np.random.RandomState(self.split_seed)
+            idx_all = np.arange(len(all_samples))
+            rng.shuffle(idx_all)
+
+            num_train = int(len(idx_all) * self.train_ratio)
+            if split == "train":
+                chosen = idx_all[:num_train]
+            elif split in ("val", "test"):
+                chosen = idx_all[num_train:]
+            else:
+                raise ValueError(
+                    f"Unknown split={split}, expected one of [None,'train','val','test']")
+            self.samples = [all_samples[i] for i in chosen]
+
+        self.max_vid = 0
+        for v in self.num_views_by_seq.values():
+            if int(v) > 0:
+                self.max_vid = max(self.max_vid, int(v) - 1)
+        if self.max_vid > 0:
+            self.num_views = max(self.num_views, self.max_vid + 1)
+
+        print(
+            f"[ZJUViewSynthDataset] total frames(all) = {len(all_samples)}, "
+            f"split={split}, used={len(self.samples)}"
+        )
+        if len(self.cam_name_to_id) > 0:
+            self.num_views = max(self.num_views, len(self.cam_name_to_id))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def _decode_cam_name(self, name):
+        if isinstance(name, bytes):
+            return name.decode("utf-8")
+        return str(name)
+
+    def _resolve_img_path(self, path_str):
+        import re
+        if isinstance(path_str, bytes):
+            path_str = path_str.decode("utf-8")
+        s = str(path_str).strip()
+
+        # 统一分隔符（Linux 下反斜杠会被当作普通字符）
+        s = s.replace("\\", "/")
+
+        # 1) Linux/Posix 绝对路径：直接用
+        if osp.isabs(s):
+            return s
+
+        # 2) Windows 绝对路径：形如 "F:/..."" 或 "C:/..."
+        if re.match(r"^[A-Za-z]:/", s):
+            # 优先从 /zju_mocap/ 之后截断（最稳）
+            key = "/zju_mocap/"
+            if key in s:
+                s = s.split(key, 1)[1]
+            else:
+                # 次选：从 CoreView_xxx 之后截断
+                parts = s.split("/")
+                cut = None
+                for i, p in enumerate(parts):
+                    if p.startswith("CoreView_"):
+                        cut = i
+                        break
+                if cut is not None:
+                    s = "/".join(parts[cut:])
+                else:
+                    # 兜底：从任意 seq_name 截断
+                    for seq in getattr(self, "seq_names", []):
+                        if seq in s:
+                            s = seq + s.split(seq, 1)[1]
+                            break
+
+            s = s.lstrip("/")
+            return osp.join(self.root, s)
+
+        # 3) 普通相对路径：拼到 root
+        return osp.join(self.root, s.lstrip("/"))
+
+    def _process_depth_like(self, arr: np.ndarray) -> np.ndarray:
+        """兼容 (H,W) 和 (H,W,1)，统一成 (H,W)"""
+        if arr.ndim == 3 and arr.shape[-1] == 1:
+            arr = arr[..., 0]
+        return arr
+
+    def _normalize_conf(self, conf: np.ndarray) -> np.ndarray:
+        """把置信度图规范到 float32 的 [0,1]。
+
+        常见来源会出现：
+        - 已经是 [0,1] 的 float
+        - uint8 / float 的 [0,255]
+        - 任意正尺度（回退：除以 max）
+        """
+        conf = conf.astype(np.float32, copy=False)
+        if conf.size == 0:
+            return conf
+        # NaN/Inf 清零，避免训练炸掉
+        if not np.isfinite(conf).all():
+            conf = np.nan_to_num(conf, nan=0.0, posinf=0.0, neginf=0.0)
+        maxv = float(conf.max())
+        if maxv <= 1.5:
+            pass
+        elif maxv <= 32.0:
+            conf = conf / (maxv + 1e-8)
+        elif maxv <= 255.0 + 1e-3:
+            conf = conf / 255.0
+        else:
+            conf = conf / (maxv + 1e-8)
+        conf = np.clip(conf, 0.0, 1.0)
+        return conf
+
+    def __getitem__(self, index):
+        meta = self.samples[index]
+        geom_path = meta["geom_path"]
+
+        data = np.load(geom_path, allow_pickle=True)
+
+        img_paths = data["img_paths"]     # (V,)
+        depth = data["depth"]         # (V,Hd,Wd) or (V,Hd,Wd,1)
+        depth_conf = data["depth_conf"]    # (V,Hd,Wd) or (V,Hd,Wd,1)
+        pointmap = data["pointmap"]      # (V,Hd,Wd,3)
+
+        V = int(img_paths.shape[0])
+        if V < 2:
+            raise RuntimeError(
+                f"[ZJUViewSynthDataset] V={V} (<2) in {geom_path}")
+
+        cam_names = data["cam_names"] if "cam_names" in data else None
+        if cam_names is not None:
+            cam_names = [self._decode_cam_name(n) for n in cam_names]
+            try:
+                cam_ids = np.array([self.cam_name_to_id[n]
+                                   for n in cam_names], dtype=np.int64)
+            except KeyError as e:
+                raise KeyError(
+                    f"[ZJUViewSynthDataset] unknown cam name in npz: {e}")
+        else:
+            cam_ids = np.arange(V)
+        num_src = min(self.num_src_views, V - 1)
+
+        # --- 选 src/tgt：train 可随机，val/test 建议固定 ---
+        if self.deterministic_views:
+            # 用 global_idx 固定（不受 split 子集 index 变化影响）
+            seed = self.view_seed + int(meta.get("global_idx", index))
+            rng = np.random.RandomState(seed)
+            perm = rng.permutation(cam_ids)
+        else:
+            perm = np.random.permutation(cam_ids)
+
+        src_idxs = perm[:num_src]
+        tgt_idx = perm[num_src]
+        src_vids = cam_ids[src_idxs]
+        tgt_vid = cam_ids[tgt_idx]
+
+        # --- 读取 src ---
+        src_imgs = []
+        src_depths = []
+        src_confs = []
+        src_pointmaps = []
+
+        for idx in src_idxs:
+            img_path = self._resolve_img_path(img_paths[idx])
+            img = Image.open(img_path).convert("RGB")
+            img_t = TF.to_tensor(img)  # (3,H,W) [0,1]
+
+            d = self._process_depth_like(depth[idx])       # (Hd,Wd)
+            c = self._normalize_conf(
+                self._process_depth_like(depth_conf[idx]))  # (Hd,Wd)
+            pm = pointmap[idx]                              # (Hd,Wd,3)
+
+            d_t = torch.from_numpy(d).float().unsqueeze(0)         # (1,Hd,Wd)
+            c_t = torch.from_numpy(c).float().unsqueeze(0)         # (1,Hd,Wd)
+            pm_t = torch.from_numpy(pm).permute(2, 0, 1).float()    # (3,Hd,Wd)
+
+            src_imgs.append(img_t)
+            src_depths.append(d_t)
+            src_confs.append(c_t)
+            src_pointmaps.append(pm_t)
+
+        # --- 读取 tgt ---
+        tgt_img_path = self._resolve_img_path(img_paths[tgt_idx])
+        tgt_img_pil = Image.open(tgt_img_path).convert("RGB")
+        tgt_img = TF.to_tensor(tgt_img_pil)  # (3,H,W)
+
+        d = self._process_depth_like(depth[tgt_idx])
+        c = self._normalize_conf(self._process_depth_like(depth_conf[tgt_idx]))
+        pm = pointmap[tgt_idx]
+
+        tgt_depth = torch.from_numpy(d).float().unsqueeze(0)      # (1,Hd,Wd)
+        tgt_conf = torch.from_numpy(c).float().unsqueeze(0)      # (1,Hd,Wd)
+        tgt_pointmap = torch.from_numpy(pm).permute(
+            2, 0, 1).float()  # (3,Hd,Wd)
+
+        # --- 堆叠 ---
+        src_imgs = torch.stack(src_imgs, dim=0)        # (S,3,H,W)
+        src_depths = torch.stack(src_depths, dim=0)      # (S,1,Hd,Wd)
+        src_confs = torch.stack(src_confs, dim=0)       # (S,1,Hd,Wd)
+        src_pointmaps = torch.stack(src_pointmaps, dim=0)   # (S,3,Hd,Wd)
+
+        sample = {
+            "src_imgs": src_imgs,
+            "src_depth": src_depths,
+            "src_depth_conf": src_confs,
+            "src_pointmap": src_pointmaps,
+            "tgt_img": tgt_img,
+            "tgt_depth": tgt_depth,
+            "tgt_depth_conf": tgt_conf,
+            "tgt_conf": tgt_conf,  # 兼容旧 key
+            "tgt_pointmap": tgt_pointmap,
+            "tgt_vid": torch.tensor(tgt_vid, dtype=torch.long),
+            "src_vids": torch.tensor(src_vids, dtype=torch.long),
+        }
+        return sample
