@@ -92,6 +92,11 @@ class GeomViewDecoderAblation(nn.Module):
         view_dim: int = 16,
         view_affine_strength: float = 1.0,
         view_cond_mode: str = "tgt",
+        rgb_sigmoid_temp: float = 1.0,
+        conf_sigmoid_temp: float = 1.0,
+        conf_gate_detach: bool = False,
+        conf_gate_floor: float = 0.0,
+        conf_bias_init: float = None,
     ):
         super().__init__()
 
@@ -100,6 +105,9 @@ class GeomViewDecoderAblation(nn.Module):
             num_views=0,
             view_dim=int(view_dim),
             view_affine_strength=float(view_affine_strength),
+            rgb_sigmoid_temp=float(rgb_sigmoid_temp),
+            conf_sigmoid_temp=float(conf_sigmoid_temp),
+            conf_bias_init=conf_bias_init,
         )
         self.ref_mode = ref_mode
         self.use_conf_gate = use_conf_gate
@@ -109,6 +117,12 @@ class GeomViewDecoderAblation(nn.Module):
         self.view_dim = int(view_dim)
         self.view_affine_strength = float(view_affine_strength)
         self.view_cond_mode = str(view_cond_mode)
+        self.conf_gate_detach = bool(conf_gate_detach)
+        self.conf_gate_floor = float(conf_gate_floor)
+        if self.conf_gate_floor < 0.0:
+            self.conf_gate_floor = 0.0
+        if self.conf_gate_floor > 1.0:
+            self.conf_gate_floor = 1.0
 
         # 把 ref_rgb 先过一个 1x1，给模型一点“学着用 skip”的自由度
         self.skip_proj = nn.Conv2d(3, 3, kernel_size=1, bias=True)
@@ -191,14 +205,25 @@ class GeomViewDecoderAblation(nn.Module):
           pred_conf:(B,1,H,W) in [0,1]
           aux: 可选，含 core/ref/after_skip 等中间量
         """
-        pred_core, pred_conf = self.core(
-            src_imgs,
-            src_depth,
-            src_depth_conf,
-            src_pointmap,
-            tgt_vid=tgt_vid,
-            src_vids=src_vids,
-        )
+        if return_aux:
+            pred_core, pred_conf, logits = self.core(
+                src_imgs,
+                src_depth,
+                src_depth_conf,
+                src_pointmap,
+                tgt_vid=tgt_vid,
+                src_vids=src_vids,
+                return_logits=True,
+            )
+        else:
+            pred_core, pred_conf = self.core(
+                src_imgs,
+                src_depth,
+                src_depth_conf,
+                src_pointmap,
+                tgt_vid=tgt_vid,
+                src_vids=src_vids,
+            )
         # pred_core 已经是 sigmoid 后的 [0,1]
 
         ref_rgb = self.pick_ref_rgb(src_imgs)              # (B,3,H,W)
@@ -207,6 +232,11 @@ class GeomViewDecoderAblation(nn.Module):
 
         if self.use_conf_gate:
             gate = pred_conf                               # (B,1,H,W)
+            if self.conf_gate_detach:
+                gate = gate.detach()
+            if self.conf_gate_floor > 0.0:
+                gate = gate * (1.0 - self.conf_gate_floor) + self.conf_gate_floor
+            gate = gate.clamp(0.0, 1.0)
             # (B,3,H,W) broadcast
             ref_term = ref_proj * gate
         else:
@@ -241,7 +271,14 @@ class GeomViewDecoderAblation(nn.Module):
             "ref_proj": ref_proj.detach(),
             "alpha": alpha.detach(),
             "pred_after_skip": pred_after_skip.detach(),
+            "use_conf_gate": bool(self.use_conf_gate),
+            "conf_gate_detach": bool(self.conf_gate_detach),
+            "conf_gate_floor": float(self.conf_gate_floor),
         }
+        if return_aux and logits is not None:
+            rgb_logits, conf_logits = logits
+            aux["rgb_logits"] = rgb_logits.detach()
+            aux["conf_logits"] = conf_logits.detach()
         if delta is not None:
             aux["tone_delta"] = delta.detach()
 

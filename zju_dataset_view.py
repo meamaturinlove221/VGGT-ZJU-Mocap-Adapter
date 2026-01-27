@@ -202,6 +202,24 @@ class ZJUViewSynthDataset(Dataset):
         conf = np.clip(conf, 0.0, 1.0)
         return conf
 
+    def _assert_depth_shapes(self, d, c, pm, geom_path, view_idx, view_id, role):
+        if d.ndim != 2 or c.ndim != 2 or pm.ndim != 3 or pm.shape[-1] != 3:
+            raise ValueError(
+                f"[ZJUViewSynthDataset] bad shape in {role} view "
+                f"(view_idx={view_idx}, view_id={view_id}) "
+                f"in {geom_path}: "
+                f"depth={getattr(d, 'shape', None)}, "
+                f"conf={getattr(c, 'shape', None)}, "
+                f"pointmap={getattr(pm, 'shape', None)}"
+            )
+        if d.shape != c.shape or pm.shape[:2] != d.shape:
+            raise ValueError(
+                f"[ZJUViewSynthDataset] mismatched shape in {role} view "
+                f"(view_idx={view_idx}, view_id={view_id}) "
+                f"in {geom_path}: "
+                f"depth={d.shape}, conf={c.shape}, pointmap={pm.shape}"
+            )
+
     def __getitem__(self, index):
         meta = self.samples[index]
         geom_path = meta["geom_path"]
@@ -260,6 +278,10 @@ class ZJUViewSynthDataset(Dataset):
             c = self._normalize_conf(
                 self._process_depth_like(depth_conf[idx]))  # (Hd,Wd)
             pm = pointmap[idx]                              # (Hd,Wd,3)
+            self._assert_depth_shapes(
+                d, c, pm, geom_path,
+                int(idx), int(cam_ids[idx]), "src"
+            )
 
             d_t = torch.from_numpy(d).float().unsqueeze(0)         # (1,Hd,Wd)
             c_t = torch.from_numpy(c).float().unsqueeze(0)         # (1,Hd,Wd)
@@ -278,6 +300,10 @@ class ZJUViewSynthDataset(Dataset):
         d = self._process_depth_like(depth[tgt_idx])
         c = self._normalize_conf(self._process_depth_like(depth_conf[tgt_idx]))
         pm = pointmap[tgt_idx]
+        self._assert_depth_shapes(
+            d, c, pm, geom_path,
+            int(tgt_idx), int(tgt_vid), "tgt"
+        )
 
         tgt_depth = torch.from_numpy(d).float().unsqueeze(0)      # (1,Hd,Wd)
         tgt_conf = torch.from_numpy(c).float().unsqueeze(0)      # (1,Hd,Wd)

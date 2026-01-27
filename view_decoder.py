@@ -1,5 +1,6 @@
 # view_decoder.py （只放核心的 SimpleViewDecoder）
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -127,6 +128,9 @@ class GeomViewDecoder(nn.Module):
         num_views: int = 0,
         view_dim: int = 16,
         view_affine_strength: float = 1.0,
+        rgb_sigmoid_temp: float = 1.0,
+        conf_sigmoid_temp: float = 1.0,
+        conf_bias_init: float = None,
     ):
         super().__init__()
         C = base_channels
@@ -135,6 +139,9 @@ class GeomViewDecoder(nn.Module):
         self.hidden = int(C)
         self.num_views = int(num_views) if num_views is not None else 0
         self.view_affine_strength = float(view_affine_strength)
+        self.rgb_sigmoid_temp = float(rgb_sigmoid_temp)
+        self.conf_sigmoid_temp = float(conf_sigmoid_temp)
+        self.conf_bias_init = conf_bias_init
         self.view_embed = None
         self.view_to_gb = None
         self.view_to_rgb = None
@@ -184,6 +191,7 @@ class GeomViewDecoder(nn.Module):
 
         # 最终输出 RGB(3) + conf(1)
         self.out_conv = nn.Conv2d(C, 4, kernel_size=3, padding=1)
+        self._init_conf_bias(self.conf_bias_init)
 
     def _init_view_cond(self, num_views: int, view_dim: int):
         self.view_embed = nn.Embedding(num_views, view_dim)
@@ -193,6 +201,18 @@ class GeomViewDecoder(nn.Module):
         nn.init.zeros_(self.view_to_gb.bias)
         nn.init.zeros_(self.view_to_rgb.weight)
         nn.init.zeros_(self.view_to_rgb.bias)
+
+    def _init_conf_bias(self, conf_bias_init: float):
+        if conf_bias_init is None:
+            return
+        if not hasattr(self.out_conv, "bias") or self.out_conv.bias is None:
+            return
+        val = float(conf_bias_init)
+        if 0.0 < val < 1.0:
+            val = math.log(val / (1.0 - val))
+        with torch.no_grad():
+            if self.out_conv.bias.numel() >= 4:
+                self.out_conv.bias[3] = val
 
     def _apply_view_cond(self, feat: torch.Tensor, tgt_vid: torch.Tensor):
         if (not self.use_view_cond) or tgt_vid is None:
@@ -240,7 +260,16 @@ class GeomViewDecoder(nn.Module):
         db = out[:, 3:].view(B, 3, 1, 1)
         return rgb * (1.0 + dg) + db
 
-    def forward(self, src_imgs, src_depth, src_depth_conf, src_pointmap, tgt_vid=None, src_vids=None):
+    def forward(
+        self,
+        src_imgs,
+        src_depth,
+        src_depth_conf,
+        src_pointmap,
+        tgt_vid=None,
+        src_vids=None,
+        return_logits: bool = False,
+    ):
         """
         src_imgs:       (B,S,3,H,W)
         src_depth:      (B,S,1,Hd,Wd)
@@ -327,11 +356,17 @@ class GeomViewDecoder(nn.Module):
         u1 = self.dec1(u1)
 
         out = self.out_conv(u1)                         # (B,4,H,W)
-        rgb = torch.sigmoid(out[:, :3, :, :])           # (B,3,H,W)
-        conf_out = torch.sigmoid(out[:, 3:4, :, :])     # (B,1,H,W)
+        rgb_logits = out[:, :3, :, :]
+        conf_logits = out[:, 3:4, :, :]
+        t_rgb = self.rgb_sigmoid_temp if self.rgb_sigmoid_temp > 0 else 1.0
+        t_conf = self.conf_sigmoid_temp if self.conf_sigmoid_temp > 0 else 1.0
+        rgb = torch.sigmoid(rgb_logits / t_rgb)         # (B,3,H,W)
+        conf_out = torch.sigmoid(conf_logits / t_conf)  # (B,1,H,W)
 
         rgb = self._apply_view_affine(rgb, tgt_vid, src_vids)
 
+        if return_logits:
+            return rgb, conf_out, (rgb_logits, conf_logits)
         return rgb, conf_out
 # ============================================================
 # Ablation 版：在 GeomViewDecoder 外面包一层

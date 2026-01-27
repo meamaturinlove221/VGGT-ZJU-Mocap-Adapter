@@ -594,6 +594,7 @@ def build_masks_from_batch(
     conf_use_quantile: bool = True,
     conf_qlo: float = 0.05,
     conf_qhi: float = 0.95,
+    use_conf_in_train_mask: bool = True,
 ):
     H, W = pred_hw
 
@@ -675,6 +676,10 @@ def build_masks_from_batch(
         valid_mask=valid_mask,
     )
     conf_soft = conf_soft.clamp(0, 1) * valid_mask
+    conf_gate_mode = "conf_soft"
+    if not use_conf_in_train_mask:
+        conf_soft = torch.ones_like(valid_mask)
+        conf_gate_mode = "all_ones"
 
     # ---- train mask ----
     train_mask = (fg_mask * conf_soft).clamp(0, 1)
@@ -703,6 +708,7 @@ def build_masks_from_batch(
         "cover_fg": float(fg_mask.mean().item()),
         "cover_conf": float(conf_soft.mean().item()),
         "cover_valid": float(valid_mask.mean().item()),
+        "conf_gate_mode": conf_gate_mode,
         "source_fg_key": source_fg_key,
         "source_valid_key": source_valid_key,
         "source_depth_conf_key": depth_conf_key,
@@ -1016,6 +1022,14 @@ def parse_args():
     p.add_argument("--use_conf_gate", action="store_true", default=True)
     p.add_argument("--no_use_conf_gate", dest="use_conf_gate",
                    action="store_false", help="Disable confidence gate")
+    p.add_argument("--conf_gate_detach", action="store_true", default=False,
+                   help="Detach pred_conf before gating RGB skip")
+    p.add_argument("--no_conf_gate_detach", dest="conf_gate_detach",
+                   action="store_false", help="Allow RGB loss to backprop into pred_conf gate")
+    p.add_argument("--conf_gate_floor", type=float, default=0.0,
+                   help="Minimum gate value to avoid all-zero conf (0~1)")
+    p.add_argument("--conf_bias_init", type=float, default=-1.0,
+                   help="Init conf bias; in (0,1) treated as prob, <0 disables")
     p.add_argument("--use_tone", action="store_true", default=True)
     p.add_argument("--no_use_tone", dest="use_tone",
                    action="store_false", help="Disable tone head")
@@ -1047,6 +1061,10 @@ def parse_args():
 
     p.add_argument("--conf_thr", type=float, default=0.2)
     p.add_argument("--conf_temp", type=float, default=0.06)
+    p.add_argument("--use_conf_loss_gate", action="store_true", default=True,
+                   help="Use depth_conf soft gate in train/recon weights")
+    p.add_argument("--no_use_conf_loss_gate", dest="use_conf_loss_gate",
+                   action="store_false", help="Disable depth_conf gating in loss weights")
     p.add_argument("--train_min_cover", type=float, default=0.10)
     p.add_argument("--fg_thr", type=float, default=0.5)
     p.add_argument("--fg_min_cover", type=float, default=0.05)
@@ -1243,6 +1261,7 @@ def main():
     # ---------------------------
     # Model
     # ---------------------------
+    conf_bias_init = None if float(args.conf_bias_init) < 0 else float(args.conf_bias_init)
     model = GeomViewDecoderAblation(
         ref_mode=args.ref_mode,
         use_conf_gate=args.use_conf_gate,
@@ -1253,6 +1272,9 @@ def main():
         view_dim=args.view_dim,
         view_affine_strength=args.view_affine_strength,
         view_cond_mode=args.view_cond_mode,
+        conf_gate_detach=bool(args.conf_gate_detach),
+        conf_gate_floor=float(args.conf_gate_floor),
+        conf_bias_init=conf_bias_init,
     ).to(device)
 
     if args.compile and hasattr(torch, "compile"):
@@ -1436,10 +1458,11 @@ def main():
                         conf_raw_min=args.conf_raw_min,
                         conf_raw_max=args.conf_raw_max,
                         conf_auto_norm=args.conf_auto_norm,
-                        conf_use_quantile=args.conf_use_quantile,
-                        conf_qlo=args.conf_qlo,
-                        conf_qhi=args.conf_qhi,
-                    )
+                    conf_use_quantile=args.conf_use_quantile,
+                    conf_qlo=args.conf_qlo,
+                    conf_qhi=args.conf_qhi,
+                    use_conf_in_train_mask=args.use_conf_loss_gate,
+                )
                     l1w = masked_l1(pred_rgb, tgt_img, recon_weight)
 
                 bs = tgt_img.size(0)
@@ -1567,6 +1590,7 @@ def main():
                     conf_use_quantile=args.conf_use_quantile,
                     conf_qlo=args.conf_qlo,
                     conf_qhi=args.conf_qhi,
+                    use_conf_in_train_mask=args.use_conf_loss_gate,
                 )
 
                 recon_loss = masked_l1(pred_rgb, tgt_img, recon_weight)
