@@ -143,6 +143,8 @@ dmypy.json
 **/tmp/
 **/outputs/skyseg.onnx
 skyseg.onnx
+overfit_debug/
+debug_viewdec_ablation/
 
 # pixi environments
 .pixi

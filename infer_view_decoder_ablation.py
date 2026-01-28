@@ -108,6 +108,10 @@ def build_cfg_from_ckpt_and_cli(ckpt_args: Dict[str, Any], cli: Any) -> SimpleNa
         cfg.conf_thr = float(cli.conf_thr)
     if cli.conf_temp is not None:
         cfg.conf_temp = float(cli.conf_temp)
+    if getattr(cli, "fg_keep_largest_cc", None) is not None:
+        cfg.fg_keep_largest_cc = bool(cli.fg_keep_largest_cc)
+    if getattr(cli, "fg_lcc_min_pixels", None) is not None:
+        cfg.fg_lcc_min_pixels = int(cli.fg_lcc_min_pixels)
     if getattr(cli, "use_view_cond", None) is not None:
         cfg.use_view_cond = bool(cli.use_view_cond)
     if getattr(cli, "num_views", None) is not None:
@@ -152,6 +156,10 @@ def build_cfg_from_ckpt_and_cli(ckpt_args: Dict[str, Any], cli: Any) -> SimpleNa
         cfg.fg_min_cover = 0.05
     if not hasattr(cfg, "fg_dilate_k"):
         cfg.fg_dilate_k = 7
+    if not hasattr(cfg, "fg_keep_largest_cc"):
+        cfg.fg_keep_largest_cc = True
+    if not hasattr(cfg, "fg_lcc_min_pixels"):
+        cfg.fg_lcc_min_pixels = 32
     if not hasattr(cfg, "valid_min_cover"):
         cfg.valid_min_cover = 0.10
     if not hasattr(cfg, "valid_dilate_k"):
@@ -362,6 +370,8 @@ def main():
     parser.add_argument("--init_alpha", type=float, default=None)
     parser.add_argument("--conf_thr", type=float, default=None)
     parser.add_argument("--conf_temp", type=float, default=None)
+    parser.add_argument("--fg_keep_largest_cc", type=int, default=None, choices=[0, 1])
+    parser.add_argument("--fg_lcc_min_pixels", type=int, default=None)
     parser.add_argument("--use_view_cond", nargs="?", const=1,
                         default=None, type=int, choices=[0, 1])
     parser.add_argument("--num_views", type=int, default=None)
@@ -533,7 +543,7 @@ def main():
             use_amp = bool(getattr(cfg, "amp", False)
                            or getattr(cfg, "use_amp", False))
             with autocast_ctx(device=device, enabled=use_amp):
-                pred_rgb, pred_conf, _ = model(
+                pred_rgb, pred_conf, aux_pred = model(
                     src_imgs,
                     src_depth,
                     src_depth_conf,
@@ -555,6 +565,8 @@ def main():
                     fg_thr=float(cfg.fg_thr),
                     fg_min_cover=float(cfg.fg_min_cover),
                     fg_dilate_k=int(cfg.fg_dilate_k),
+                    fg_keep_largest_cc=bool(cfg.fg_keep_largest_cc),
+                    fg_lcc_min_pixels=int(cfg.fg_lcc_min_pixels),
                     valid_min_cover=float(cfg.valid_min_cover),
                     valid_dilate_k=int(cfg.valid_dilate_k),
                     valid_k_max=int(cfg.valid_k_max),
@@ -604,6 +616,8 @@ def main():
                                 fg_thr=float(cfg.fg_thr),
                                 fg_min_cover=float(cfg.fg_min_cover),
                                 fg_dilate_k=int(cfg.fg_dilate_k),
+                                fg_keep_largest_cc=bool(cfg.fg_keep_largest_cc),
+                                fg_lcc_min_pixels=int(cfg.fg_lcc_min_pixels),
                                 valid_min_cover=float(cfg.valid_min_cover),
                                 valid_dilate_k=int(cfg.valid_dilate_k),
                                 valid_k_max=int(cfg.valid_k_max),
@@ -664,6 +678,8 @@ def main():
                     "recon_weight": recon_weight.detach(),
                     "valid_mask": valid_mask.detach(),
                 }
+                if isinstance(aux_pred, dict) and aux_pred.get("gate", None) is not None:
+                    aux_dbg["gate"] = aux_pred.get("gate")
                 save_debug_pack(
                     pred_rgb,
                     tgt_img,

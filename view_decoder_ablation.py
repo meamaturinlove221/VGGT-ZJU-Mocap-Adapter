@@ -230,13 +230,15 @@ class GeomViewDecoderAblation(nn.Module):
         ref_proj = self.skip_proj(ref_rgb)                 # (B,3,H,W)
         alpha = self.get_alpha()                           # scalar
 
+        gate = None
         if self.use_conf_gate:
             gate = pred_conf                               # (B,1,H,W)
             if self.conf_gate_detach:
                 gate = gate.detach()
             if self.conf_gate_floor > 0.0:
-                gate = gate * (1.0 - self.conf_gate_floor) + self.conf_gate_floor
-            gate = gate.clamp(0.0, 1.0)
+                gate = gate.clamp(min=self.conf_gate_floor, max=1.0)
+            else:
+                gate = gate.clamp(0.0, 1.0)
             # (B,3,H,W) broadcast
             ref_term = ref_proj * gate
         else:
@@ -275,6 +277,8 @@ class GeomViewDecoderAblation(nn.Module):
             "conf_gate_detach": bool(self.conf_gate_detach),
             "conf_gate_floor": float(self.conf_gate_floor),
         }
+        if gate is not None:
+            aux["gate"] = gate.detach()
         if return_aux and logits is not None:
             rgb_logits, conf_logits = logits
             aux["rgb_logits"] = rgb_logits.detach()

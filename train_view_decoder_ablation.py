@@ -20,6 +20,20 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from pathlib import Path
 
+try:
+    import cv2  # type: ignore
+    _HAS_CV2 = True
+except Exception:
+    cv2 = None
+    _HAS_CV2 = False
+
+try:
+    from scipy import ndimage as _scipy_ndimage  # type: ignore
+    _HAS_SCIPY = True
+except Exception:
+    _scipy_ndimage = None
+    _HAS_SCIPY = False
+
 from view_decoder_ablation import GeomViewDecoderAblation
 from zju_dataset_view import ZJUViewSynthDataset
 
@@ -211,6 +225,94 @@ def dilate_mask(mask: torch.Tensor, k: int = 7) -> torch.Tensor:
     pad = k // 2
     dil = F.max_pool2d(mask01, kernel_size=k, stride=1, padding=pad)
     return (dil > 0.5).float()
+
+
+def _largest_cc_numpy(mask_u8: np.ndarray, min_pixels: int = 16) -> np.ndarray:
+    if mask_u8.sum() < min_pixels:
+        return mask_u8
+    if _HAS_CV2 and cv2 is not None:
+        try:
+            num, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, connectivity=4)
+            if num <= 1:
+                return mask_u8
+            areas = stats[1:, cv2.CC_STAT_AREA]
+            max_idx = int(np.argmax(areas)) + 1
+            if areas[max_idx - 1] < min_pixels:
+                return mask_u8
+            return (labels == max_idx).astype(np.uint8)
+        except Exception:
+            pass
+    if _HAS_SCIPY and _scipy_ndimage is not None:
+        try:
+            labels, num = _scipy_ndimage.label(mask_u8)
+            if num <= 1:
+                return mask_u8
+            counts = np.bincount(labels.reshape(-1))
+            if counts.size <= 1:
+                return mask_u8
+            counts[0] = 0
+            max_label = int(np.argmax(counts))
+            if counts[max_label] < min_pixels:
+                return mask_u8
+            return (labels == max_label).astype(np.uint8)
+        except Exception:
+            pass
+
+    H, W = mask_u8.shape
+    labels = np.zeros((H, W), dtype=np.int32)
+    max_area = 0
+    max_label = 0
+    label = 0
+    for y in range(H):
+        for x in range(W):
+            if mask_u8[y, x] == 0 or labels[y, x] != 0:
+                continue
+            label += 1
+            stack = [(y, x)]
+            labels[y, x] = label
+            area = 1
+            while stack:
+                cy, cx = stack.pop()
+                ny = cy - 1
+                if ny >= 0 and mask_u8[ny, cx] and labels[ny, cx] == 0:
+                    labels[ny, cx] = label
+                    stack.append((ny, cx))
+                    area += 1
+                ny = cy + 1
+                if ny < H and mask_u8[ny, cx] and labels[ny, cx] == 0:
+                    labels[ny, cx] = label
+                    stack.append((ny, cx))
+                    area += 1
+                nx = cx - 1
+                if nx >= 0 and mask_u8[cy, nx] and labels[cy, nx] == 0:
+                    labels[cy, nx] = label
+                    stack.append((cy, nx))
+                    area += 1
+                nx = cx + 1
+                if nx < W and mask_u8[cy, nx] and labels[cy, nx] == 0:
+                    labels[cy, nx] = label
+                    stack.append((cy, nx))
+                    area += 1
+            if area > max_area:
+                max_area = area
+                max_label = label
+    if max_area < min_pixels or max_label == 0:
+        return mask_u8
+    return (labels == max_label).astype(np.uint8)
+
+
+def keep_largest_connected_component(mask: torch.Tensor, min_pixels: int = 16) -> torch.Tensor:
+    m = _ensure_4d(mask)
+    if m is None:
+        return None
+    m = (m > 0.5).float()
+    B, _, H, W = m.shape
+    out = torch.zeros_like(m)
+    for b in range(B):
+        mb = m[b, 0].detach().cpu().numpy().astype(np.uint8)
+        out_np = _largest_cc_numpy(mb, min_pixels=int(min_pixels))
+        out[b, 0] = torch.from_numpy(out_np).to(device=m.device, dtype=m.dtype)
+    return out
 
 
 def ensure_min_cover_by_dilation(mask_bin: torch.Tensor, min_cover: float, k0: int = 7, k_max: int = 31) -> torch.Tensor:
@@ -584,6 +686,8 @@ def build_masks_from_batch(
     fg_thr: float = 0.5,
     fg_min_cover: float = 0.05,
     fg_dilate_k: int = 7,
+    fg_keep_largest_cc: bool = True,
+    fg_lcc_min_pixels: int = 32,
     valid_min_cover: float = 0.10,
     valid_dilate_k: int = 7,
     valid_k_max: int = 31,
@@ -657,6 +761,10 @@ def build_masks_from_batch(
     else:
         fg_mask0 = valid_mask.clone()
         source_fg_key = "__fallback_valid__"
+
+    if fg_keep_largest_cc:
+        fg_mask0 = keep_largest_connected_component(
+            fg_mask0, min_pixels=int(fg_lcc_min_pixels))
 
     fg_mask = ensure_min_cover_by_dilation(
         fg_mask0, float(fg_min_cover), int(fg_dilate_k), 31)
@@ -841,13 +949,33 @@ def tv_l1(x: torch.Tensor) -> torch.Tensor:
 # ---------------------------
 def save_debug_pack(pred, tgt, aux, step, out_dir="debug_viewdec_ablation", prefix="train", split_cat_panels: bool = True):
     os.makedirs(out_dir, exist_ok=True)
-    pred_img = to_u8_img(pred[0], name="pred")
+    pred_raw = pred
+    pred_vis = pred
+    vis_weight = None
+    if isinstance(aux, dict):
+        gate = aux.get("gate", None)
+        recon_weight = aux.get("recon_weight", None)
+        if torch.is_tensor(gate):
+            vis_weight = gate
+        if torch.is_tensor(recon_weight):
+            vis_weight = recon_weight if vis_weight is None else (vis_weight * recon_weight)
+    if vis_weight is not None:
+        pred_vis = (pred * vis_weight).clamp(0, 1)
+
+    pred_raw_img = to_u8_img(pred_raw[0], name="pred_raw")
+    pred_vis_img = to_u8_img(pred_vis[0], name="pred_vis")
+    pred_img = pred_raw_img
     tgt_img = to_u8_img(tgt[0], name="tgt")
 
     path_pred = os.path.join(out_dir, f"{prefix}_pred_step{step:06d}.png")
     path_tgt = os.path.join(out_dir, f"{prefix}_tgt_step{step:06d}.png")
     save_png(pred_img, path_pred)
     save_png(tgt_img, path_tgt)
+
+    path_pred_raw = os.path.join(out_dir, f"{prefix}_pred_raw_step{step:06d}.png")
+    path_pred_vis = os.path.join(out_dir, f"{prefix}_pred_vis_step{step:06d}.png")
+    save_png(pred_raw_img, path_pred_raw)
+    save_png(pred_vis_img, path_pred_vis)
 
     cat_pt = np.concatenate([pred_img, tgt_img], axis=1)
     path_cat_pt = os.path.join(
@@ -888,7 +1016,7 @@ def save_debug_pack(pred, tgt, aux, step, out_dir="debug_viewdec_ablation", pref
             save_cat_panels(cat, path_cat)
 
     for key in ["valid_mask", "fg_mask", "train_mask", "recon_weight",
-                "tgt_depth_conf", "tgt_depth_conf_raw", "pred_conf"]:
+                "tgt_depth_conf", "tgt_depth_conf_raw", "pred_conf", "gate"]:
         if key in aux and isinstance(aux[key], torch.Tensor):
             _save1(key, aux[key])
 
@@ -1069,6 +1197,8 @@ def parse_args():
     p.add_argument("--fg_thr", type=float, default=0.5)
     p.add_argument("--fg_min_cover", type=float, default=0.05)
     p.add_argument("--fg_dilate_k", type=int, default=7)
+    p.add_argument("--fg_keep_largest_cc", type=int, default=1, choices=[0, 1])
+    p.add_argument("--fg_lcc_min_pixels", type=int, default=32)
     p.add_argument("--valid_min_cover", type=float, default=0.10)
     p.add_argument("--valid_dilate_k", type=int, default=7)
     p.add_argument("--valid_k_max", type=int, default=31)
@@ -1428,7 +1558,7 @@ def main():
                     src_vids = src_vids.to(device, non_blocking=True)
 
                 with autocast_ctx(device=device, enabled=(args.amp and device == "cuda")):
-                    pred_rgb, pred_conf, _ = eval_model(
+                    pred_rgb, pred_conf, aux_pred = eval_model(
                         src_imgs,
                         src_depth,
                         src_depth_conf,
@@ -1451,6 +1581,8 @@ def main():
                         fg_thr=args.fg_thr,
                         fg_min_cover=args.fg_min_cover,
                         fg_dilate_k=args.fg_dilate_k,
+                        fg_keep_largest_cc=args.fg_keep_largest_cc,
+                        fg_lcc_min_pixels=args.fg_lcc_min_pixels,
                         valid_min_cover=args.valid_min_cover,
                         valid_dilate_k=args.valid_dilate_k,
                         valid_k_max=args.valid_k_max,
@@ -1512,6 +1644,8 @@ def main():
                         "recon_weight": recon_weight.detach(),
                         "valid_mask": valid_mask.detach(),
                     }
+                    if isinstance(aux_pred, dict) and aux_pred.get("gate", None) is not None:
+                        aux_dbg["gate"] = aux_pred.get("gate")
                     save_debug_pack(
                         pred_rgb, tgt_img, aux_dbg, global_step,
                         out_dir=os.path.join(args.log_dir, "val"),
@@ -1559,7 +1693,7 @@ def main():
                 src_vids = src_vids.to(device, non_blocking=True)
 
             with autocast_ctx(device=device, enabled=(args.amp and device == "cuda")):
-                pred_rgb, pred_conf, _ = model(
+                pred_rgb, pred_conf, aux_pred = model(
                     src_imgs,
                     src_depth,
                     src_depth_conf,
@@ -1580,6 +1714,8 @@ def main():
                     fg_thr=args.fg_thr,
                     fg_min_cover=args.fg_min_cover,
                     fg_dilate_k=args.fg_dilate_k,
+                    fg_keep_largest_cc=args.fg_keep_largest_cc,
+                    fg_lcc_min_pixels=args.fg_lcc_min_pixels,
                     valid_min_cover=args.valid_min_cover,
                     valid_dilate_k=args.valid_dilate_k,
                     valid_k_max=args.valid_k_max,
@@ -1814,6 +1950,8 @@ def main():
                     "recon_weight": recon_weight.detach(),
                     "valid_mask": valid_mask.detach(),
                 }
+                if isinstance(aux_pred, dict) and aux_pred.get("gate", None) is not None:
+                    aux_dbg["gate"] = aux_pred.get("gate")
                 save_debug_pack(
                     pred_rgb, tgt_img, aux_dbg, global_step,
                     out_dir=os.path.join(args.log_dir, "train"),

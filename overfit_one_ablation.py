@@ -1,8 +1,9 @@
 import os
 import time
 import argparse
+import numpy as np
+from PIL import Image
 import torch
-import torch.nn.functional as F
 
 from zju_dataset_view import ZJUViewSynthDataset
 from view_decoder_ablation import GeomViewDecoderAblation
@@ -28,6 +29,9 @@ def main():
     ap.add_argument('--lr', type=float, default=1e-4)
     ap.add_argument('--device', type=str, default='cuda')
     ap.add_argument('--out_dir', type=str, default='overfit_debug')
+    ap.add_argument('--run_name', type=str, default='')
+    ap.add_argument('--stat_every', type=int, default=20)
+    ap.add_argument('--diff_against', type=str, default='')
 
     # mask/weight knobs (keep same spirit as training defaults)
     ap.add_argument('--conf_thr', type=float, default=0.2)
@@ -37,6 +41,8 @@ def main():
     ap.add_argument('--fg_thr', type=float, default=0.5)
     ap.add_argument('--fg_min_cover', type=float, default=0.05)
     ap.add_argument('--fg_dilate_k', type=int, default=7)
+    ap.add_argument('--fg_keep_largest_cc', type=int, default=1, choices=[0, 1])
+    ap.add_argument('--fg_lcc_min_pixels', type=int, default=32)
     ap.add_argument('--valid_min_cover', type=float, default=0.10)
     ap.add_argument('--valid_dilate_k', type=int, default=7)
     ap.add_argument('--valid_k_max', type=int, default=31)
@@ -64,7 +70,10 @@ def main():
     args = ap.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
-    os.makedirs(args.out_dir, exist_ok=True)
+    out_dir = args.out_dir
+    if str(args.run_name).strip():
+        out_dir = os.path.join(out_dir, str(args.run_name).strip())
+    os.makedirs(out_dir, exist_ok=True)
 
     split = None if args.split == 'None' else args.split
     deterministic_views = True  # overfit 必须固定 src/tgt，不然你在追移动靶
@@ -145,9 +154,64 @@ def main():
         f'use_conf_loss_gate={int(bool(args.use_conf_loss_gate))} '
         f'conf_gate_detach={int(bool(args.conf_gate_detach))} '
         f'conf_gate_floor={float(args.conf_gate_floor):.3f} '
-        f'conf_bias_init={float(args.conf_bias_init):.3f}'
+        f'conf_bias_init={float(args.conf_bias_init):.3f} '
+        f'out_dir={out_dir}'
     )
     t0 = time.time()
+
+    def _stats(x: torch.Tensor, mask: torch.Tensor = None):
+        if x is None or (not torch.is_tensor(x)):
+            return None
+        x = x.detach()
+        if mask is not None:
+            m = mask.detach()
+            if m.ndim != x.ndim:
+                m = m.expand_as(x)
+            m = (m > 0.5)
+            if m.sum().item() == 0:
+                return None
+            x = x[m]
+        else:
+            x = x.reshape(-1)
+        if x.numel() == 0:
+            return None
+        mean = float(x.mean().item())
+        std = float(x.std(unbiased=False).item())
+        mn = float(x.min().item())
+        mx = float(x.max().item())
+        return mean, mn, mx, std
+
+    def _fmt_stats(name, s_full, s_mask):
+        if s_full is None:
+            return f'{name}: NA'
+        fmean, fmin, fmax, fstd = s_full
+        if s_mask is None:
+            return (f'{name} full(mean/min/max/std)='
+                    f'{fmean:.4f}/{fmin:.4f}/{fmax:.4f}/{fstd:.4f} '
+                    f'train=NA')
+        mmean, mmin, mmax, mstd = s_mask
+        return (f'{name} full(mean/min/max/std)='
+                f'{fmean:.4f}/{fmin:.4f}/{fmax:.4f}/{fstd:.4f} '
+                f'train(mean/min/max/std)='
+                f'{mmean:.4f}/{mmin:.4f}/{mmax:.4f}/{mstd:.4f}')
+
+    def _pct(x: torch.Tensor, thr: float, mode: str):
+        if x is None or (not torch.is_tensor(x)) or x.numel() == 0:
+            return float('nan')
+        if mode == "lt":
+            return float((x < thr).float().mean().item() * 100.0)
+        return float((x > thr).float().mean().item() * 100.0)
+
+    def _diff_png(path_a: str, path_b: str, out_path: str):
+        if (not os.path.isfile(path_a)) or (not os.path.isfile(path_b)):
+            return False
+        a = np.array(Image.open(path_a))
+        b = np.array(Image.open(path_b))
+        if a.shape != b.shape:
+            return False
+        diff = np.abs(a.astype(np.int16) - b.astype(np.int16)).astype(np.uint8)
+        Image.fromarray(diff).save(out_path)
+        return True
     for step in range(1, int(args.steps)+1):
         model.train()
         opt.zero_grad(set_to_none=True)
@@ -172,6 +236,8 @@ def main():
                 fg_thr=float(args.fg_thr),
                 fg_min_cover=float(args.fg_min_cover),
                 fg_dilate_k=int(args.fg_dilate_k),
+                fg_keep_largest_cc=bool(args.fg_keep_largest_cc),
+                fg_lcc_min_pixels=int(args.fg_lcc_min_pixels),
                 valid_min_cover=float(args.valid_min_cover),
                 valid_dilate_k=int(args.valid_dilate_k),
                 valid_k_max=int(args.valid_k_max),
@@ -189,13 +255,18 @@ def main():
         loss.backward()
         opt.step()
 
-        if step % 20 == 0 or step == 1:
+        if step % int(args.stat_every) == 0 or step == 1:
             dt = time.time() - t0
             with torch.no_grad():
                 l1_full = (pred_rgb - tgt_img).abs().mean()
                 train_mean = train_mask.float().mean()
                 weight_mean = recon_weight.float().mean()
                 weight_ratio = weight_mean / (train_mean + 1e-8)
+                gate = aux.get('gate', None) if isinstance(aux, dict) else None
+                gate_active = bool(aux.get('use_conf_gate', False)) if isinstance(aux, dict) else False
+                gate_mode = "conf" if gate_active else "disabled->ones"
+                if (gate is None) and pred_conf is not None:
+                    gate = torch.ones_like(pred_conf)
                 if int(args.print_logits):
                     rgb_logits = aux.get('rgb_logits', None) if isinstance(aux, dict) else None
                     conf_logits = aux.get('conf_logits', None) if isinstance(aux, dict) else None
@@ -220,11 +291,25 @@ def main():
                    if int(args.print_logits) else '')
                 + f'  dt={dt:.1f}s'
             )
+            pc_full = _stats(pred_conf, None)
+            pc_mask = _stats(pred_conf, train_mask)
+            gate_full = _stats(gate, None)
+            gate_mask = _stats(gate, train_mask)
+            rw_full = _stats(recon_weight, None)
+            rw_mask = _stats(recon_weight, train_mask)
+            pct_lo = _pct(gate, float(args.conf_gate_floor), "lt")
+            pct_hi = _pct(gate, 0.9, "gt")
+            print(f'[stats] {_fmt_stats("pred_conf", pc_full, pc_mask)}')
+            print(f'[stats] {_fmt_stats(f"gate({gate_mode})", gate_full, gate_mask)} '
+                  f'pct<floor={pct_lo:.2f}% pct>0.9={pct_hi:.2f}%')
+            print(f'[stats] {_fmt_stats("recon_weight", rw_full, rw_mask)} '
+                  f'conf_gate_mode={aux_masks.get("conf_gate_mode", "conf_soft")}')
 
         if step % 100 == 0 or step in (1,):
             model.eval()
             aux_dbg = {
                 'pred_conf': pred_conf.detach(),
+                'gate': aux.get('gate', None) if isinstance(aux, dict) else None,
                 'tgt_depth_conf': aux_masks.get('tgt_depth_conf', None),
                 'tgt_depth_conf_raw': aux_masks.get('tgt_depth_conf_raw', None),
                 'fg_mask': fg_mask.detach(),
@@ -233,9 +318,21 @@ def main():
                 'valid_mask': valid_mask.detach(),
             }
             save_debug_pack(pred_rgb.detach(), tgt_img.detach(), aux_dbg, step,
-                            out_dir=args.out_dir, prefix=f'overfit_i{idx}', split_cat_panels=True)
+                            out_dir=out_dir, prefix=f'overfit_i{idx}', split_cat_panels=True)
 
-    print('[done] check images in', args.out_dir)
+            diff_against = str(args.diff_against).strip()
+            if diff_against and os.path.abspath(diff_against) != os.path.abspath(out_dir):
+                diff_dir = os.path.join(
+                    out_dir, f'diff_vs_{os.path.basename(diff_against)}')
+                os.makedirs(diff_dir, exist_ok=True)
+                for key in ("pred_conf", "recon_weight", "gate"):
+                    fname = f'overfit_i{idx}_{key}_step{step:06d}.png'
+                    path_a = os.path.join(out_dir, fname)
+                    path_b = os.path.join(diff_against, fname)
+                    out_path = os.path.join(diff_dir, f'diff_{key}_step{step:06d}.png')
+                    _diff_png(path_a, path_b, out_path)
+
+    print('[done] check images in', out_dir)
 
 
 if __name__ == '__main__':
