@@ -176,6 +176,42 @@ class ZJUViewSynthDataset(Dataset):
             arr = arr[..., 0]
         return arr
 
+    def _infer_mask_path(self, img_path: str):
+        """Infer mask path from image path by swapping images -> mask_cihp/mask."""
+        if not img_path:
+            return None
+        s = str(img_path).replace("\\", "/")
+        parts = s.split("/")
+        idx_images = None
+        idx_cam = None
+        if "images" in parts:
+            idx_images = parts.index("images")
+        else:
+            for i, p in enumerate(parts):
+                if p.startswith("Camera_"):
+                    idx_cam = i
+                    break
+        if idx_images is None and idx_cam is None:
+            return None
+
+        def _build(mask_dir: str):
+            if idx_images is not None:
+                parts2 = list(parts)
+                parts2[idx_images] = mask_dir
+            else:
+                parts2 = list(parts[:idx_cam]) + [mask_dir] + list(parts[idx_cam:])
+            out = "/".join(parts2)
+            base, _ = osp.splitext(out)
+            return base + ".png"
+
+        p_mask = _build("mask")
+        if osp.isfile(p_mask):
+            return p_mask
+        p_cihp = _build("mask_cihp")
+        if osp.isfile(p_cihp):
+            return p_cihp
+        return None
+
     def _normalize_conf(self, conf: np.ndarray) -> np.ndarray:
         """把置信度图规范到 float32 的 [0,1]。
 
@@ -296,6 +332,17 @@ class ZJUViewSynthDataset(Dataset):
         tgt_img_path = self._resolve_img_path(img_paths[tgt_idx])
         tgt_img_pil = Image.open(tgt_img_path).convert("RGB")
         tgt_img = TF.to_tensor(tgt_img_pil)  # (3,H,W)
+        mask_path = self._infer_mask_path(tgt_img_path)
+        if mask_path is None:
+            raise FileNotFoundError(
+                f"[ZJUViewSynthDataset] mask not found for: {tgt_img_path}"
+            )
+        tgt_mask_pil = Image.open(mask_path).convert("L")
+        if tgt_mask_pil.size != tgt_img_pil.size:
+            tgt_mask_pil = tgt_mask_pil.resize(
+                tgt_img_pil.size, resample=Image.NEAREST)
+        tgt_mask = torch.from_numpy(np.array(tgt_mask_pil)).float()
+        tgt_fg = (tgt_mask > 0).float()
 
         d = self._process_depth_like(depth[tgt_idx])
         c = self._normalize_conf(self._process_depth_like(depth_conf[tgt_idx]))
@@ -325,6 +372,7 @@ class ZJUViewSynthDataset(Dataset):
             "tgt_depth": tgt_depth,
             "tgt_depth_conf": tgt_conf,
             "tgt_conf": tgt_conf,  # 兼容旧 key
+            "tgt_fg": tgt_fg,
             "tgt_pointmap": tgt_pointmap,
             "tgt_vid": torch.tensor(tgt_vid, dtype=torch.long),
             "src_vids": torch.tensor(src_vids, dtype=torch.long),

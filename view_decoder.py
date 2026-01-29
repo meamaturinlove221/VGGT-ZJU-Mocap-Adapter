@@ -130,6 +130,8 @@ class GeomViewDecoder(nn.Module):
         view_affine_strength: float = 1.0,
         rgb_sigmoid_temp: float = 1.0,
         conf_sigmoid_temp: float = 1.0,
+        split_conf_head: bool = False,
+        logit_clip: float = 0.0,
         conf_bias_init: float = None,
     ):
         super().__init__()
@@ -141,6 +143,8 @@ class GeomViewDecoder(nn.Module):
         self.view_affine_strength = float(view_affine_strength)
         self.rgb_sigmoid_temp = float(rgb_sigmoid_temp)
         self.conf_sigmoid_temp = float(conf_sigmoid_temp)
+        self.split_conf_head = bool(split_conf_head)
+        self.logit_clip = float(logit_clip)
         self.conf_bias_init = conf_bias_init
         self.view_embed = None
         self.view_to_gb = None
@@ -190,7 +194,11 @@ class GeomViewDecoder(nn.Module):
         )
 
         # 最终输出 RGB(3) + conf(1)
-        self.out_conv = nn.Conv2d(C, 4, kernel_size=3, padding=1)
+        if self.split_conf_head:
+            self.out_rgb = nn.Conv2d(C, 3, kernel_size=3, padding=1)
+            self.out_conf = nn.Conv2d(C, 1, kernel_size=3, padding=1)
+        else:
+            self.out_conv = nn.Conv2d(C, 4, kernel_size=3, padding=1)
         self._init_conf_bias(self.conf_bias_init)
 
     def _init_view_cond(self, num_views: int, view_dim: int):
@@ -205,14 +213,21 @@ class GeomViewDecoder(nn.Module):
     def _init_conf_bias(self, conf_bias_init: float):
         if conf_bias_init is None:
             return
-        if not hasattr(self.out_conv, "bias") or self.out_conv.bias is None:
-            return
         val = float(conf_bias_init)
+        # Interpret init as target prob or logit before sigmoid; compensate for temp
+        t_conf = self.conf_sigmoid_temp if self.conf_sigmoid_temp > 0 else 1.0
         if 0.0 < val < 1.0:
             val = math.log(val / (1.0 - val))
+        val = val * float(t_conf)
         with torch.no_grad():
-            if self.out_conv.bias.numel() >= 4:
-                self.out_conv.bias[3] = val
+            if self.split_conf_head:
+                if hasattr(self, "out_conf") and self.out_conf.bias is not None:
+                    if self.out_conf.bias.numel() >= 1:
+                        self.out_conf.bias[0] = val
+            else:
+                if hasattr(self, "out_conv") and self.out_conv.bias is not None:
+                    if self.out_conv.bias.numel() >= 4:
+                        self.out_conv.bias[3] = val
 
     def _apply_view_cond(self, feat: torch.Tensor, tgt_vid: torch.Tensor):
         if (not self.use_view_cond) or tgt_vid is None:
@@ -355,9 +370,20 @@ class GeomViewDecoder(nn.Module):
         u1 = torch.cat([u1, x1_agg], dim=1)             # (B,2C,H,W)
         u1 = self.dec1(u1)
 
-        out = self.out_conv(u1)                         # (B,4,H,W)
-        rgb_logits = out[:, :3, :, :]
-        conf_logits = out[:, 3:4, :, :]
+        if self.split_conf_head:
+            rgb_logits = self.out_rgb(u1)               # (B,3,H,W)
+            conf_logits = self.out_conf(u1)             # (B,1,H,W)
+            if self.logit_clip and self.logit_clip > 0:
+                rgb_logits = rgb_logits.clamp(
+                    min=-self.logit_clip, max=self.logit_clip)
+                conf_logits = conf_logits.clamp(
+                    min=-self.logit_clip, max=self.logit_clip)
+        else:
+            out = self.out_conv(u1)                     # (B,4,H,W)
+            if self.logit_clip and self.logit_clip > 0:
+                out = out.clamp(min=-self.logit_clip, max=self.logit_clip)
+            rgb_logits = out[:, :3, :, :]
+            conf_logits = out[:, 3:4, :, :]
         t_rgb = self.rgb_sigmoid_temp if self.rgb_sigmoid_temp > 0 else 1.0
         t_conf = self.conf_sigmoid_temp if self.conf_sigmoid_temp > 0 else 1.0
         rgb = torch.sigmoid(rgb_logits / t_rgb)         # (B,3,H,W)

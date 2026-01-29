@@ -94,6 +94,8 @@ class GeomViewDecoderAblation(nn.Module):
         view_cond_mode: str = "tgt",
         rgb_sigmoid_temp: float = 1.0,
         conf_sigmoid_temp: float = 1.0,
+        split_conf_head: bool = False,
+        logit_clip: float = 0.0,
         conf_gate_detach: bool = False,
         conf_gate_floor: float = 0.0,
         conf_bias_init: float = None,
@@ -107,7 +109,9 @@ class GeomViewDecoderAblation(nn.Module):
             view_affine_strength=float(view_affine_strength),
             rgb_sigmoid_temp=float(rgb_sigmoid_temp),
             conf_sigmoid_temp=float(conf_sigmoid_temp),
+            split_conf_head=bool(split_conf_head),
             conf_bias_init=conf_bias_init,
+            logit_clip=float(logit_clip),
         )
         self.ref_mode = ref_mode
         self.use_conf_gate = use_conf_gate
@@ -198,6 +202,8 @@ class GeomViewDecoderAblation(nn.Module):
         tgt_vid: torch.Tensor = None,
         return_aux: bool = False,
         src_vids: torch.Tensor = None,
+        use_conf_gate_override: bool = None,
+        conf_gate_strength: float = None,
     ):
         """
         返回：
@@ -230,8 +236,16 @@ class GeomViewDecoderAblation(nn.Module):
         ref_proj = self.skip_proj(ref_rgb)                 # (B,3,H,W)
         alpha = self.get_alpha()                           # scalar
 
+        use_gate = self.use_conf_gate if use_conf_gate_override is None else bool(
+            use_conf_gate_override)
+        gate_strength = 1.0 if conf_gate_strength is None else float(
+            conf_gate_strength)
+        if gate_strength < 0.0:
+            gate_strength = 0.0
+        if gate_strength > 1.0:
+            gate_strength = 1.0
         gate = None
-        if self.use_conf_gate:
+        if use_gate:
             gate = pred_conf                               # (B,1,H,W)
             if self.conf_gate_detach:
                 gate = gate.detach()
@@ -239,6 +253,8 @@ class GeomViewDecoderAblation(nn.Module):
                 gate = gate.clamp(min=self.conf_gate_floor, max=1.0)
             else:
                 gate = gate.clamp(0.0, 1.0)
+            if gate_strength < 1.0:
+                gate = (1.0 - gate_strength) + gate_strength * gate
             # (B,3,H,W) broadcast
             ref_term = ref_proj * gate
         else:
@@ -273,7 +289,8 @@ class GeomViewDecoderAblation(nn.Module):
             "ref_proj": ref_proj.detach(),
             "alpha": alpha.detach(),
             "pred_after_skip": pred_after_skip.detach(),
-            "use_conf_gate": bool(self.use_conf_gate),
+            "use_conf_gate": bool(use_gate),
+            "conf_gate_strength": float(gate_strength),
             "conf_gate_detach": bool(self.conf_gate_detach),
             "conf_gate_floor": float(self.conf_gate_floor),
         }

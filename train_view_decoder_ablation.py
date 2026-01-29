@@ -37,6 +37,9 @@ except Exception:
 from view_decoder_ablation import GeomViewDecoderAblation
 from zju_dataset_view import ZJUViewSynthDataset
 
+# Global args holder for optional access in helpers.
+args = None
+
 # train_view_decoder_ablation_v3.py
 # -*- coding: utf-8 -*-
 """
@@ -150,6 +153,15 @@ def autocast_ctx(device: str, enabled: bool):
     except Exception:
         return torch.cuda.amp.autocast(enabled=True)
 
+def resolve_conf_bias_init(raw: float) -> Optional[float]:
+    try:
+        val = float(raw)
+    except Exception:
+        return None
+    if math.isnan(val) or val == -1.0:
+        return None
+    return val
+
 
 # ---------------------------
 # Utils
@@ -159,6 +171,22 @@ def save_png(arr_u8_hwc: np.ndarray, path: str):
     if d:
         os.makedirs(d, exist_ok=True)
     Image.fromarray(arr_u8_hwc).save(path)
+
+
+def _parse_only_steps_env(env_key: str = "ONLY_STEPS") -> set:
+    raw = os.environ.get(env_key, "").strip()
+    if not raw:
+        return set()
+    parts = re.split(r"[,\s;/]+", raw)
+    out = set()
+    for p in parts:
+        if not p:
+            continue
+        try:
+            out.add(int(p))
+        except Exception:
+            continue
+    return out
 
 
 def _as_torch(x):
@@ -699,6 +727,15 @@ def build_masks_from_batch(
     conf_qlo: float = 0.05,
     conf_qhi: float = 0.95,
     use_conf_in_train_mask: bool = True,
+    pred_conf_gate: Optional[torch.Tensor] = None,
+    use_conf_gate: Optional[bool] = None,
+    conf_gate_detach: Optional[bool] = None,
+    conf_gate_floor: Optional[float] = None,
+    conf_gate_gamma: Optional[float] = None,
+    conf_gate_strength: Optional[float] = None,
+    recon_gate_floor: Optional[float] = None,
+    recon_weight_renorm: Optional[bool] = None,
+    recon_weight_clip_max: Optional[float] = None,
 ):
     H, W = pred_hw
 
@@ -800,8 +837,96 @@ def build_masks_from_batch(
             train_mask = valid_mask.clone()
             cover_train = float(train_mask.mean().item())
 
-    recon_weight = (float(bg_weight) + (1.0 - float(bg_weight))
-                    * train_mask).clamp(0, 1)
+    # --- conf gate (optional) ---
+    def _resolve_opt(value, name: str, default):
+        if value is not None:
+            return value
+        if args is not None and hasattr(args, name):
+            return getattr(args, name)
+        return default
+
+    use_conf_gate = bool(_resolve_opt(use_conf_gate, "use_conf_gate", False))
+    conf_gate_detach = bool(_resolve_opt(
+        conf_gate_detach, "conf_gate_detach", False))
+    conf_gate_floor = float(_resolve_opt(
+        conf_gate_floor, "conf_gate_floor", 0.0))
+    conf_gate_gamma = float(_resolve_opt(
+        conf_gate_gamma, "conf_gate_gamma", 1.0))
+    conf_gate_strength = _resolve_opt(
+        conf_gate_strength, "conf_gate_strength", None)
+    if conf_gate_strength is None:
+        conf_gate_strength = 1.0
+    conf_gate_strength = float(conf_gate_strength)
+    if conf_gate_strength < 0.0:
+        conf_gate_strength = 0.0
+    if conf_gate_strength > 1.0:
+        conf_gate_strength = 1.0
+    recon_gate_floor = _resolve_opt(
+        recon_gate_floor, "recon_gate_floor", None)
+    if recon_gate_floor is None:
+        recon_gate_floor = conf_gate_floor
+    recon_gate_floor = float(recon_gate_floor)
+    if recon_gate_floor < 0.0:
+        recon_gate_floor = 0.0
+    if recon_gate_floor > 1.0:
+        recon_gate_floor = 1.0
+    recon_weight_renorm = bool(_resolve_opt(
+        recon_weight_renorm, "recon_weight_renorm", False))
+    recon_weight_clip_max = float(_resolve_opt(
+        recon_weight_clip_max, "recon_weight_clip_max", 1.0))
+
+    gate_conf = pred_conf_gate
+    if gate_conf is None and batch is not None:
+        # prefer model predicted confidence if present
+        gate_conf = batch.get('pred_conf', None)
+    if gate_conf is None:
+        gate_conf = train_mask.new_ones(train_mask.shape)
+    else:
+        gate_conf = gate_conf.to(device).float()
+        if gate_conf.dim() == 2:
+            gate_conf = gate_conf[None, None, ...]
+        elif gate_conf.dim() == 3:
+            gate_conf = gate_conf.unsqueeze(1)
+        if gate_conf.dim() == 4 and gate_conf.shape[1] != 1:
+            gate_conf = gate_conf[:, :1, ...]
+        if gate_conf.shape[-2:] != (H, W):
+            gate_conf = F.interpolate(
+                gate_conf, size=(H, W), mode="bilinear", align_corners=False)
+
+    # gate_conf expected in [0,1]; clamp/gamma/soft-floor + strength if configured
+    if use_conf_gate:
+        gate_conf = gate_conf.clamp(0.0, 1.0)
+        if abs(conf_gate_gamma - 1.0) > 1e-6:
+            gate_conf = gate_conf.pow(conf_gate_gamma)
+        if recon_gate_floor > 0.0:
+            gate_conf = recon_gate_floor + \
+                (1.0 - recon_gate_floor) * gate_conf
+        if conf_gate_detach:
+            gate_conf = gate_conf.detach()
+        if conf_gate_strength < 1.0:
+            gate_conf = (1.0 - conf_gate_strength) + \
+                conf_gate_strength * gate_conf
+    else:
+        gate_conf = train_mask.new_ones(train_mask.shape)
+
+    # NOTE: recon weight anchors on fg_mask; bg weight is explicit & separate
+    fg_mask_safe = fg_mask.clamp(0.0, 1.0)
+    recon_fg = fg_mask_safe * gate_conf
+    if float(bg_weight) > 0.0:
+        recon_weight_raw = recon_fg + (1.0 - fg_mask_safe) * float(bg_weight)
+    else:
+        recon_weight_raw = recon_fg
+    recon_weight = recon_weight_raw
+    if recon_weight_renorm:
+        renorm_mask = fg_mask_safe
+        denom = (recon_weight * renorm_mask).sum()
+        target = renorm_mask.sum()
+        if float(target.item()) > 0.0:
+            scale = (target / (denom + 1e-8)).detach()
+            recon_weight = recon_weight * scale
+    if recon_weight_clip_max > 0:
+        recon_weight = recon_weight.clamp(
+            min=0.0, max=float(recon_weight_clip_max))
     recon_weight = recon_weight * valid_mask
 
     aux = {
@@ -810,6 +935,14 @@ def build_masks_from_batch(
         "conf_info": conf_info,
         "fg_mask": fg_mask.detach(),
         "train_mask": train_mask.detach(),
+        "gate_loss": gate_conf.detach(),
+        "use_conf_gate_loss": bool(use_conf_gate),
+        "conf_gate_gamma": float(conf_gate_gamma),
+        "conf_gate_strength": float(conf_gate_strength),
+        "recon_gate_floor": float(recon_gate_floor),
+        "recon_weight_renorm": bool(recon_weight_renorm),
+        "recon_weight_clip_max": float(recon_weight_clip_max),
+        "recon_weight_raw": recon_weight_raw.detach(),
         "recon_weight": recon_weight.detach(),
         "valid_mask": valid_mask.detach(),
         "cover_train": cover_train,
@@ -1015,8 +1148,10 @@ def save_debug_pack(pred, tgt, aux, step, out_dir="debug_viewdec_ablation", pref
         if split_cat_panels:
             save_cat_panels(cat, path_cat)
 
-    for key in ["valid_mask", "fg_mask", "train_mask", "recon_weight",
-                "tgt_depth_conf", "tgt_depth_conf_raw", "pred_conf", "gate"]:
+    for key in ["valid_mask", "fg_mask", "train_mask",
+                "recon_weight_raw", "recon_weight",
+                "tgt_depth_conf", "tgt_depth_conf_raw",
+                "pred_conf", "gate", "gate_loss"]:
         if key in aux and isinstance(aux[key], torch.Tensor):
             _save1(key, aux[key])
 
@@ -1107,6 +1242,8 @@ def parse_args():
     p.add_argument("--epochs", type=int, default=130)
     p.add_argument("--lr", type=float, default=5e-5)
     p.add_argument("--weight_decay", type=float, default=1e-4)
+    p.add_argument("--conf_head_lr_mult", type=float, default=0.1,
+                   help="LR multiplier for core.out_conv (RGB+conf head). Set 1.0 to disable.")
 
     p.add_argument("--train_ratio", type=float, default=0.9)
     p.add_argument("--split_seed", type=int, default=0)
@@ -1150,14 +1287,27 @@ def parse_args():
     p.add_argument("--use_conf_gate", action="store_true", default=True)
     p.add_argument("--no_use_conf_gate", dest="use_conf_gate",
                    action="store_false", help="Disable confidence gate")
-    p.add_argument("--conf_gate_detach", action="store_true", default=False,
-                   help="Detach pred_conf before gating RGB skip")
+    p.add_argument("--conf_gate_detach", action="store_true", default=True,
+                   help="Detach pred_conf before gating RGB skip/loss weights (default on)")
     p.add_argument("--no_conf_gate_detach", dest="conf_gate_detach",
                    action="store_false", help="Allow RGB loss to backprop into pred_conf gate")
     p.add_argument("--conf_gate_floor", type=float, default=0.0,
-                   help="Minimum gate value to avoid all-zero conf (0~1)")
+                   help="Skip gate floor (model ref skip), 0~1")
+    p.add_argument("--conf_gate_gamma", type=float, default=0.5,
+                   help="Loss gate gamma (>1 emphasizes high-conf, <1 flattens)")
+    p.add_argument("--recon_gate_floor", type=float, default=0.2,
+                   help="Soft floor for recon weight gate: w = fg * (floor + (1-floor)*conf)")
+    p.add_argument("--conf_gate_warmup", type=int, default=200,
+                   help="Disable pred_conf gate for first N optimizer steps (loss weighting only)")
+    p.add_argument("--conf_gate_ramp", type=int, default=0,
+                   help="Ramp steps after warmup to smoothly enable conf gate (0 = hard switch)")
+    p.add_argument("--conf_gate_ramp_mode", type=str, default="linear",
+                   choices=["linear", "cosine", "exp"],
+                   help="Ramp mode for conf gate strength")
+    p.add_argument("--conf_gate_ramp_k", type=float, default=5.0,
+                   help="Exp ramp sharpness (only for exp mode)")
     p.add_argument("--conf_bias_init", type=float, default=-1.0,
-                   help="Init conf bias; in (0,1) treated as prob, <0 disables")
+                   help="Init conf bias; -1 disables, (0,1) treated as prob, other values as logits (temp-aware)")
     p.add_argument("--use_tone", action="store_true", default=True)
     p.add_argument("--no_use_tone", dest="use_tone",
                    action="store_false", help="Disable tone head")
@@ -1173,6 +1323,14 @@ def parse_args():
     p.add_argument("--finetune_view_only", nargs="?", const=1, default=0,
                    type=int, choices=[0, 1])
     p.add_argument("--reset_optim", action="store_true", default=False)
+    p.add_argument("--rgb_sigmoid_temp", type=float, default=1.0,
+                   help="RGB sigmoid temperature (larger => softer)")
+    p.add_argument("--conf_sigmoid_temp", type=float, default=2.0,
+                   help="Conf sigmoid temperature (larger => softer)")
+    p.add_argument("--split_conf_head", action="store_true", default=False,
+                   help="Use separate RGB/Conf heads (conf head can use lower LR)")
+    p.add_argument("--logit_clip", type=float, default=10.0,
+                   help="Clamp RGB/Conf logits to [-clip, clip] (<=0 to disable)")
 
     p.add_argument("--lambda_percep", type=float, default=0.05)
     p.add_argument("--lambda_conf", type=float, default=1e-3)
@@ -1203,6 +1361,12 @@ def parse_args():
     p.add_argument("--valid_dilate_k", type=int, default=7)
     p.add_argument("--valid_k_max", type=int, default=31)
     p.add_argument("--bg_weight", type=float, default=0.05)
+    p.add_argument("--recon_weight_renorm", action="store_true", default=False,
+                   help="Renormalize recon_weight so train-mask mean ~1")
+    p.add_argument("--no_recon_weight_renorm", dest="recon_weight_renorm",
+                   action="store_false", help="Disable recon_weight renorm")
+    p.add_argument("--recon_weight_clip_max", type=float, default=1.0,
+                   help="Clamp recon_weight max (<=0 to disable)")
 
     p.add_argument("--conf_raw_min", type=float, default=1.0)
     p.add_argument("--conf_raw_max", type=float, default=8.0)
@@ -1266,6 +1430,7 @@ def _normalize_seq_names(seq_names):
 
 
 def main():
+    global args
     args = parse_args()
     args.use_view_cond = bool(args.use_view_cond)
     args.finetune_view_only = bool(args.finetune_view_only)
@@ -1282,6 +1447,10 @@ def main():
 
     os.makedirs(args.log_dir, exist_ok=True)
     os.makedirs(args.ckpt_dir, exist_ok=True)
+
+    only_steps = _parse_only_steps_env()
+    if only_steps:
+        print(f"[info] ONLY_STEPS (train debug pack) = {sorted(only_steps)}")
 
     ini_logger = IniLogger(os.path.join(args.log_dir, "run_log.ini"))
     ini_logger.log("meta", {
@@ -1391,7 +1560,7 @@ def main():
     # ---------------------------
     # Model
     # ---------------------------
-    conf_bias_init = None if float(args.conf_bias_init) < 0 else float(args.conf_bias_init)
+    conf_bias_init = resolve_conf_bias_init(args.conf_bias_init)
     model = GeomViewDecoderAblation(
         ref_mode=args.ref_mode,
         use_conf_gate=args.use_conf_gate,
@@ -1402,9 +1571,13 @@ def main():
         view_dim=args.view_dim,
         view_affine_strength=args.view_affine_strength,
         view_cond_mode=args.view_cond_mode,
+        rgb_sigmoid_temp=float(args.rgb_sigmoid_temp),
+        conf_sigmoid_temp=float(args.conf_sigmoid_temp),
+        split_conf_head=bool(args.split_conf_head),
         conf_gate_detach=bool(args.conf_gate_detach),
         conf_gate_floor=float(args.conf_gate_floor),
         conf_bias_init=conf_bias_init,
+        logit_clip=float(args.logit_clip),
     ).to(device)
 
     if args.compile and hasattr(torch, "compile"):
@@ -1419,6 +1592,8 @@ def main():
         ema_model = copy.deepcopy(model).eval()
         for p in ema_model.parameters():
             p.requires_grad = False
+        ema_model.load_state_dict(model.state_dict(), strict=False)
+        print("[info] ema initialized from model (hard copy).")
 
     percep_loss_fn = VGGPerceptualLoss(slice_to=16).to(device)
 
@@ -1445,8 +1620,38 @@ def main():
     else:
         train_params = [p for p in model.parameters() if p.requires_grad]
 
-    optimizer = torch.optim.AdamW(
-        train_params, lr=args.lr, weight_decay=args.weight_decay)
+    conf_head_lr_mult = float(getattr(args, "conf_head_lr_mult", 1.0))
+    if conf_head_lr_mult != 1.0:
+        head_params = []
+        base_params = []
+        head_key = "core.out_conf" if bool(
+            getattr(model.core, "split_conf_head", False)) else "core.out_conv"
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if head_key in name:
+                head_params.append(p)
+            else:
+                base_params.append(p)
+        if head_params and base_params:
+            optimizer = torch.optim.AdamW(
+                [
+                    {"params": base_params, "lr": args.lr},
+                    {"params": head_params, "lr": args.lr *
+                        conf_head_lr_mult},
+                ],
+                weight_decay=args.weight_decay,
+            )
+            print(
+                f"[info] conf_head_lr_mult={conf_head_lr_mult:.3f} "
+                f"head_key={head_key} base={len(base_params)} head={len(head_params)}"
+            )
+        else:
+            optimizer = torch.optim.AdamW(
+                train_params, lr=args.lr, weight_decay=args.weight_decay)
+    else:
+        optimizer = torch.optim.AdamW(
+            train_params, lr=args.lr, weight_decay=args.weight_decay)
 
     scheduler = None
     total_update_steps = max(
@@ -1558,6 +1763,7 @@ def main():
                     src_vids = src_vids.to(device, non_blocking=True)
 
                 with autocast_ctx(device=device, enabled=(args.amp and device == "cuda")):
+                    conf_gate_strength = _conf_gate_strength(global_step)
                     pred_rgb, pred_conf, aux_pred = eval_model(
                         src_imgs,
                         src_depth,
@@ -1566,6 +1772,8 @@ def main():
                         tgt_vid=tgt_vid,
                         src_vids=src_vids,
                         return_aux=True,
+                        use_conf_gate_override=bool(args.use_conf_gate),
+                        conf_gate_strength=conf_gate_strength,
                     )
                     pred_conf_safe, pred_conf_mode = normalize_pred_conf(
                         pred_conf)
@@ -1590,11 +1798,20 @@ def main():
                         conf_raw_min=args.conf_raw_min,
                         conf_raw_max=args.conf_raw_max,
                         conf_auto_norm=args.conf_auto_norm,
-                    conf_use_quantile=args.conf_use_quantile,
-                    conf_qlo=args.conf_qlo,
-                    conf_qhi=args.conf_qhi,
-                    use_conf_in_train_mask=args.use_conf_loss_gate,
-                )
+                        conf_use_quantile=args.conf_use_quantile,
+                        conf_qlo=args.conf_qlo,
+                        conf_qhi=args.conf_qhi,
+                        use_conf_in_train_mask=args.use_conf_loss_gate,
+                        pred_conf_gate=pred_conf,
+                        use_conf_gate=bool(args.use_conf_gate),
+                        conf_gate_detach=args.conf_gate_detach,
+                        conf_gate_floor=args.conf_gate_floor,
+                        conf_gate_gamma=args.conf_gate_gamma,
+                        conf_gate_strength=conf_gate_strength,
+                        recon_gate_floor=args.recon_gate_floor,
+                        recon_weight_renorm=args.recon_weight_renorm,
+                        recon_weight_clip_max=args.recon_weight_clip_max,
+                    )
                     l1w = masked_l1(pred_rgb, tgt_img, recon_weight)
 
                 bs = tgt_img.size(0)
@@ -1671,6 +1888,26 @@ def main():
     # ---------------------------
     accum_steps = max(1, int(args.accum_steps))
 
+    def _conf_gate_strength(step: int) -> float:
+        if not bool(args.use_conf_gate):
+            return 0.0
+        warm = int(getattr(args, "conf_gate_warmup", 0))
+        ramp = int(getattr(args, "conf_gate_ramp", 0))
+        if warm > 0 and int(step) < warm:
+            return 0.0
+        if ramp <= 0:
+            return 1.0
+        t = max(0, int(step) - warm)
+        progress = min(1.0, float(t) / float(ramp))
+        mode = str(getattr(args, "conf_gate_ramp_mode", "linear")).lower()
+        if mode == "cosine":
+            return 0.5 - 0.5 * math.cos(math.pi * progress)
+        if mode == "exp":
+            k = float(getattr(args, "conf_gate_ramp_k", 5.0))
+            k = max(1e-6, k)
+            return (1.0 - math.exp(-k * progress)) / (1.0 - math.exp(-k))
+        return progress
+
     for epoch in range(start_epoch, args.epochs):
         model.train()
         epoch_loss = 0.0
@@ -1693,6 +1930,7 @@ def main():
                 src_vids = src_vids.to(device, non_blocking=True)
 
             with autocast_ctx(device=device, enabled=(args.amp and device == "cuda")):
+                conf_gate_strength = _conf_gate_strength(global_step)
                 pred_rgb, pred_conf, aux_pred = model(
                     src_imgs,
                     src_depth,
@@ -1701,6 +1939,8 @@ def main():
                     tgt_vid=tgt_vid,
                     src_vids=src_vids,
                     return_aux=True,
+                    use_conf_gate_override=bool(args.use_conf_gate),
+                    conf_gate_strength=conf_gate_strength,
                 )
 
                 H, W = pred_rgb.shape[-2:]
@@ -1727,6 +1967,15 @@ def main():
                     conf_qlo=args.conf_qlo,
                     conf_qhi=args.conf_qhi,
                     use_conf_in_train_mask=args.use_conf_loss_gate,
+                    pred_conf_gate=pred_conf,
+                    use_conf_gate=bool(args.use_conf_gate),
+                    conf_gate_detach=args.conf_gate_detach,
+                    conf_gate_floor=args.conf_gate_floor,
+                    conf_gate_gamma=args.conf_gate_gamma,
+                    conf_gate_strength=conf_gate_strength,
+                    recon_gate_floor=args.recon_gate_floor,
+                    recon_weight_renorm=args.recon_weight_renorm,
+                    recon_weight_clip_max=args.recon_weight_clip_max,
                 )
 
                 recon_loss = masked_l1(pred_rgb, tgt_img, recon_weight)
@@ -1867,7 +2116,13 @@ def main():
                 print(f"[epoch {epoch:02d} step {global_step:06d}] "
                       f"loss={loss.item()*accum_steps:.4f} lr={lr_now:.6g}")
 
-            if do_step and (global_step % args.debug_train_every == 0):
+            should_debug = False
+            if only_steps:
+                should_debug = int(global_step) in only_steps
+            else:
+                should_debug = (global_step % args.debug_train_every == 0)
+
+            if do_step and should_debug:
                 with torch.no_grad():
                     pred_f = pred_rgb.float().clamp(0, 1)
                     tgt_f = tgt_img.float().clamp(0, 1)
@@ -1890,6 +2145,25 @@ def main():
                         fg_mask,       mask=None,      prefix="fg_mask_")
                     st_tgtc = tensor_stats_map(
                         tgt_conf_up,   mask=valid_mask, prefix="tgt_conf01_")
+                    eps = 1e-6
+                    fg_cover_per = fg_mask.mean(
+                        dim=(1, 2, 3)).detach().cpu()
+                    valid_cover_per = valid_mask.mean(
+                        dim=(1, 2, 3)).detach().cpu()
+                    fg_cover_mean = float(fg_cover_per.mean().item())
+                    fg_cover_std = float(fg_cover_per.std(
+                        unbiased=False).item())
+                    valid_cover_mean = float(valid_cover_per.mean().item())
+                    valid_cover_std = float(valid_cover_per.std(
+                        unbiased=False).item())
+                    fg_valid_cover_per = (
+                        fg_mask * valid_mask).mean(dim=(1, 2, 3)).detach().cpu()
+                    fg_over_valid = fg_valid_cover_per / \
+                        (valid_cover_per + eps)
+                    fg_over_valid_mean = float(
+                        fg_over_valid.mean().item())
+                    fg_over_valid_std = float(
+                        fg_over_valid.std(unbiased=False).item())
 
                 ci = aux_masks.get("conf_info", {})
                 print(
@@ -1931,7 +2205,30 @@ def main():
                     "conf_mode_mask": ci.get("mode", ""),
                     "conf_mode_sup": tgt_conf_info.get("mode", ""),
                     "lr": optimizer.param_groups[0]["lr"],
+                    "conf_gate_strength": float(conf_gate_strength),
+                    "conf_gate_warmup": int(args.conf_gate_warmup),
+                    "conf_gate_ramp": int(args.conf_gate_ramp),
+                    "recon_gate_floor": float(args.recon_gate_floor),
+                    "fg_cover_mean": fg_cover_mean,
+                    "fg_cover_std": fg_cover_std,
+                    "valid_cover_mean": valid_cover_mean,
+                    "valid_cover_std": valid_cover_std,
+                    "fg_over_valid_mean": fg_over_valid_mean,
+                    "fg_over_valid_std": fg_over_valid_std,
                 }
+                gate_mean = None
+                if isinstance(aux_pred, dict):
+                    gate_t = aux_pred.get("gate", None)
+                    if torch.is_tensor(gate_t):
+                        gate_mean = float(gate_t.mean().item())
+                    gate_loss_t = aux_pred.get("gate_loss", None)
+                    if torch.is_tensor(gate_loss_t):
+                        kv["gate_loss_mean"] = float(gate_loss_t.mean().item())
+                if gate_mean is not None:
+                    kv["gate_mean"] = gate_mean
+                if torch.is_tensor(recon_weight):
+                    kv["recon_weight_mean"] = float(
+                        recon_weight.mean().item())
                 kv.update(st_conf)
                 kv.update(st_w)
                 kv.update(st_tm)

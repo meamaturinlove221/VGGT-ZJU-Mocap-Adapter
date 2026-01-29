@@ -219,6 +219,22 @@ def _normalize_seq_names(seq_names):
     return [str(seq_names)]
 
 
+def _parse_only_steps_env(env_key: str = "ONLY_STEPS") -> set:
+    raw = os.environ.get(env_key, "").strip()
+    if not raw:
+        return set()
+    parts = re.split(r"[,\s;/]+", raw)
+    out = set()
+    for p in parts:
+        if not p:
+            continue
+        try:
+            out.add(int(p))
+        except Exception:
+            continue
+    return out
+
+
 def _conf_stats_1d(
     x: Optional[torch.Tensor],
     qs: Tuple[float, ...] = (0.01, 0.05, 0.5, 0.95, 0.99),
@@ -465,6 +481,12 @@ def main():
         view_dim=int(getattr(cfg, "view_dim", 16)),
         view_affine_strength=float(getattr(cfg, "view_affine_strength", 1.0)),
         view_cond_mode=str(getattr(cfg, "view_cond_mode", "tgt")),
+        rgb_sigmoid_temp=float(getattr(cfg, "rgb_sigmoid_temp", 1.0)),
+        conf_sigmoid_temp=float(getattr(cfg, "conf_sigmoid_temp", 1.0)),
+        split_conf_head=bool(getattr(cfg, "split_conf_head", False)),
+        conf_gate_detach=bool(getattr(cfg, "conf_gate_detach", False)),
+        conf_gate_floor=float(getattr(cfg, "conf_gate_floor", 0.0)),
+        logit_clip=float(getattr(cfg, "logit_clip", 0.0)),
     )
     # these are used inside model forward
     model.conf_thr = float(getattr(cfg, "conf_thr", 0.6))
@@ -505,12 +527,9 @@ def main():
 
     max_items_to_save = (1000000000 if getattr((globals().get('cfg') or globals().get('args')),'split','val') != 'train' else 2)
 
-    raw_only_steps = __import__('os').environ.get('ONLY_STEPS','')
-
-    only_steps = set(int(x) for x in raw_only_steps.replace(';',',').split(',') if x.strip().isdigit())
-    _os=__import__('os')
-    _only_steps_s = _os.environ.get('ONLY_STEPS','').strip()
-    only_steps = set(int(x) for x in _only_steps_s.replace(';',',').split(',') if x.strip().isdigit()) if _only_steps_s else set()
+    only_steps = _parse_only_steps_env()
+    if only_steps:
+        print(f"[info] ONLY_STEPS (infer debug pack) = {sorted(only_steps)}")
     saved = 0
     conf_stats_done = False
 
@@ -577,6 +596,23 @@ def main():
                     conf_use_quantile=bool(cfg.conf_use_quantile),
                     conf_qlo=float(cfg.conf_qlo),
                     conf_qhi=float(cfg.conf_qhi),
+                    use_conf_in_train_mask=bool(
+                        getattr(cfg, "use_conf_loss_gate", True)),
+                    pred_conf_gate=pred_conf,
+                    use_conf_gate=bool(getattr(cfg, "use_conf_gate", True)),
+                    conf_gate_detach=bool(
+                        getattr(cfg, "conf_gate_detach", False)),
+                    conf_gate_floor=float(
+                        getattr(cfg, "conf_gate_floor", 0.0)),
+                    conf_gate_gamma=float(
+                        getattr(cfg, "conf_gate_gamma", 1.0)),
+                    recon_gate_floor=float(
+                        getattr(cfg, "recon_gate_floor",
+                                getattr(cfg, "conf_gate_floor", 0.0))),
+                    recon_weight_renorm=bool(
+                        getattr(cfg, "recon_weight_renorm", False)),
+                    recon_weight_clip_max=float(
+                        getattr(cfg, "recon_weight_clip_max", 1.0)),
                 )
 
                 if not conf_stats_done:
@@ -628,6 +664,24 @@ def main():
                                 conf_use_quantile=bool(cfg.conf_use_quantile),
                                 conf_qlo=float(cfg.conf_qlo),
                                 conf_qhi=float(cfg.conf_qhi),
+                                use_conf_in_train_mask=bool(
+                                    getattr(cfg, "use_conf_loss_gate", True)),
+                                pred_conf_gate=pred_conf,
+                                use_conf_gate=bool(
+                                    getattr(cfg, "use_conf_gate", True)),
+                                conf_gate_detach=bool(
+                                    getattr(cfg, "conf_gate_detach", False)),
+                                conf_gate_floor=float(
+                                    getattr(cfg, "conf_gate_floor", 0.0)),
+                                conf_gate_gamma=float(
+                                    getattr(cfg, "conf_gate_gamma", 1.0)),
+                                recon_gate_floor=float(
+                                    getattr(cfg, "recon_gate_floor",
+                                            getattr(cfg, "conf_gate_floor", 0.0))),
+                                recon_weight_renorm=bool(
+                                    getattr(cfg, "recon_weight_renorm", False)),
+                                recon_weight_clip_max=float(
+                                    getattr(cfg, "recon_weight_clip_max", 1.0)),
                             )
 
                 bsz = int(pred_rgb.shape[0])
