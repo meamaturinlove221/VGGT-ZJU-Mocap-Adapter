@@ -727,6 +727,7 @@ def build_masks_from_batch(
     conf_qlo: float = 0.05,
     conf_qhi: float = 0.95,
     use_conf_in_train_mask: bool = True,
+    train_mask_mode: Optional[str] = None,
     pred_conf_gate: Optional[torch.Tensor] = None,
     use_conf_gate: Optional[bool] = None,
     conf_gate_detach: Optional[bool] = None,
@@ -734,6 +735,7 @@ def build_masks_from_batch(
     conf_gate_gamma: Optional[float] = None,
     conf_gate_strength: Optional[float] = None,
     recon_gate_floor: Optional[float] = None,
+    recon_mask_mode: Optional[str] = None,
     recon_weight_renorm: Optional[bool] = None,
     recon_weight_clip_max: Optional[float] = None,
 ):
@@ -820,6 +822,13 @@ def build_masks_from_batch(
         conf_qhi=conf_qhi,
         valid_mask=valid_mask,
     )
+    def _resolve_opt(value, name: str, default):
+        if value is not None:
+            return value
+        if args is not None and hasattr(args, name):
+            return getattr(args, name)
+        return default
+
     conf_soft = conf_soft.clamp(0, 1) * valid_mask
     conf_gate_mode = "conf_soft"
     if not use_conf_in_train_mask:
@@ -827,23 +836,27 @@ def build_masks_from_batch(
         conf_gate_mode = "all_ones"
 
     # ---- train mask ----
-    train_mask = (fg_mask * conf_soft).clamp(0, 1)
-    cover_train = float(train_mask.mean().item())
+    train_mask_mode = str(_resolve_opt(
+        train_mask_mode, "train_mask_mode", "fg_conf")).lower()
+    if train_mask_mode not in ("fg_conf", "valid_conf", "valid_only"):
+        train_mask_mode = "fg_conf"
 
-    if cover_train < float(train_min_cover):
-        train_mask = (fg_mask * valid_mask).clamp(0, 1)
+    if train_mask_mode == "valid_only":
+        train_mask = valid_mask.clone()
+        cover_train = float(train_mask.mean().item())
+    else:
+        base_mask = valid_mask if train_mask_mode == "valid_conf" else fg_mask
+        train_mask = (base_mask * conf_soft).clamp(0, 1)
         cover_train = float(train_mask.mean().item())
         if cover_train < float(train_min_cover):
-            train_mask = valid_mask.clone()
-            cover_train = float(train_mask.mean().item())
+            if train_mask_mode == "fg_conf":
+                train_mask = (fg_mask * valid_mask).clamp(0, 1)
+                cover_train = float(train_mask.mean().item())
+            if cover_train < float(train_min_cover):
+                train_mask = valid_mask.clone()
+                cover_train = float(train_mask.mean().item())
 
     # --- conf gate (optional) ---
-    def _resolve_opt(value, name: str, default):
-        if value is not None:
-            return value
-        if args is not None and hasattr(args, name):
-            return getattr(args, name)
-        return default
 
     use_conf_gate = bool(_resolve_opt(use_conf_gate, "use_conf_gate", False))
     conf_gate_detach = bool(_resolve_opt(
@@ -874,6 +887,10 @@ def build_masks_from_batch(
         recon_weight_renorm, "recon_weight_renorm", False))
     recon_weight_clip_max = float(_resolve_opt(
         recon_weight_clip_max, "recon_weight_clip_max", 1.0))
+    recon_mask_mode = str(_resolve_opt(
+        recon_mask_mode, "recon_mask_mode", "fg")).lower()
+    if recon_mask_mode not in ("fg", "train", "valid"):
+        recon_mask_mode = "fg"
 
     gate_conf = pred_conf_gate
     if gate_conf is None and batch is not None:
@@ -909,16 +926,22 @@ def build_masks_from_batch(
     else:
         gate_conf = train_mask.new_ones(train_mask.shape)
 
-    # NOTE: recon weight anchors on fg_mask; bg weight is explicit & separate
-    fg_mask_safe = fg_mask.clamp(0.0, 1.0)
-    recon_fg = fg_mask_safe * gate_conf
+    if recon_mask_mode == "train":
+        recon_base = train_mask
+    elif recon_mask_mode == "valid":
+        recon_base = valid_mask
+    else:
+        recon_base = fg_mask
+    recon_base = recon_base.clamp(0.0, 1.0)
+
+    recon_fg = recon_base * gate_conf
     if float(bg_weight) > 0.0:
-        recon_weight_raw = recon_fg + (1.0 - fg_mask_safe) * float(bg_weight)
+        recon_weight_raw = recon_fg + (1.0 - recon_base) * float(bg_weight)
     else:
         recon_weight_raw = recon_fg
     recon_weight = recon_weight_raw
     if recon_weight_renorm:
-        renorm_mask = fg_mask_safe
+        renorm_mask = recon_base
         denom = (recon_weight * renorm_mask).sum()
         target = renorm_mask.sum()
         if float(target.item()) > 0.0:
@@ -950,6 +973,8 @@ def build_masks_from_batch(
         "cover_conf": float(conf_soft.mean().item()),
         "cover_valid": float(valid_mask.mean().item()),
         "conf_gate_mode": conf_gate_mode,
+        "train_mask_mode": train_mask_mode,
+        "recon_mask_mode": recon_mask_mode,
         "source_fg_key": source_fg_key,
         "source_valid_key": source_valid_key,
         "source_depth_conf_key": depth_conf_key,
@@ -1242,7 +1267,7 @@ def parse_args():
     p.add_argument("--epochs", type=int, default=130)
     p.add_argument("--lr", type=float, default=5e-5)
     p.add_argument("--weight_decay", type=float, default=1e-4)
-    p.add_argument("--conf_head_lr_mult", type=float, default=0.1,
+    p.add_argument("--conf_head_lr_mult", type=float, default=2.0,
                    help="LR multiplier for core.out_conv (RGB+conf head). Set 1.0 to disable.")
 
     p.add_argument("--train_ratio", type=float, default=0.9)
@@ -1271,8 +1296,8 @@ def parse_args():
     p.add_argument("--no_use_ema", dest="use_ema",
                    action="store_false", help="Disable EMA")
     p.add_argument("--ema_decay", type=float, default=0.999)
-    p.add_argument("--best_by", type=str, default="ema",
-                   choices=["ema", "raw"])
+    p.add_argument("--best_by", type=str, default="raw_psnr",
+                   choices=["raw_psnr", "raw_ssim", "raw", "raw_l1", "ema", "ema_psnr", "ema_ssim"])
 
     p.add_argument("--lr_schedule", type=str, default="cosine",
                    choices=["cosine", "plateau"])
@@ -1293,11 +1318,11 @@ def parse_args():
                    action="store_false", help="Allow RGB loss to backprop into pred_conf gate")
     p.add_argument("--conf_gate_floor", type=float, default=0.0,
                    help="Skip gate floor (model ref skip), 0~1")
-    p.add_argument("--conf_gate_gamma", type=float, default=0.5,
+    p.add_argument("--conf_gate_gamma", type=float, default=2.0,
                    help="Loss gate gamma (>1 emphasizes high-conf, <1 flattens)")
-    p.add_argument("--recon_gate_floor", type=float, default=0.2,
+    p.add_argument("--recon_gate_floor", type=float, default=0.1,
                    help="Soft floor for recon weight gate: w = fg * (floor + (1-floor)*conf)")
-    p.add_argument("--conf_gate_warmup", type=int, default=200,
+    p.add_argument("--conf_gate_warmup", type=int, default=1000,
                    help="Disable pred_conf gate for first N optimizer steps (loss weighting only)")
     p.add_argument("--conf_gate_ramp", type=int, default=0,
                    help="Ramp steps after warmup to smoothly enable conf gate (0 = hard switch)")
@@ -1325,7 +1350,7 @@ def parse_args():
     p.add_argument("--reset_optim", action="store_true", default=False)
     p.add_argument("--rgb_sigmoid_temp", type=float, default=1.0,
                    help="RGB sigmoid temperature (larger => softer)")
-    p.add_argument("--conf_sigmoid_temp", type=float, default=2.0,
+    p.add_argument("--conf_sigmoid_temp", type=float, default=1.0,
                    help="Conf sigmoid temperature (larger => softer)")
     p.add_argument("--split_conf_head", action="store_true", default=False,
                    help="Use separate RGB/Conf heads (conf head can use lower LR)")
@@ -1351,6 +1376,12 @@ def parse_args():
                    help="Use depth_conf soft gate in train/recon weights")
     p.add_argument("--no_use_conf_loss_gate", dest="use_conf_loss_gate",
                    action="store_false", help="Disable depth_conf gating in loss weights")
+    p.add_argument("--train_mask_mode", type=str, default="fg_conf",
+                   choices=["fg_conf", "valid_conf", "valid_only"],
+                   help="Train mask base: fg*conf, valid*conf, or valid only")
+    p.add_argument("--recon_mask_mode", type=str, default="valid",
+                   choices=["fg", "train", "valid"],
+                   help="Recon-weight base mask: fg, train, or valid")
     p.add_argument("--train_min_cover", type=float, default=0.10)
     p.add_argument("--fg_thr", type=float, default=0.5)
     p.add_argument("--fg_min_cover", type=float, default=0.05)
@@ -1429,6 +1460,46 @@ def _normalize_seq_names(seq_names):
     return [str(seq_names)]
 
 
+def _best_is_higher(best_by: str) -> bool:
+    key = str(best_by).lower()
+    return key in ("raw_psnr", "ema_psnr", "raw_ssim", "ema_ssim")
+
+
+def _best_init(best_by: str) -> float:
+    return -float("inf") if _best_is_higher(best_by) else float("inf")
+
+
+def _select_best_metric(
+    best_by: str,
+    raw_val: float,
+    raw_psnr: float,
+    raw_ssim: float,
+    ema_val: Optional[float],
+    ema_psnr: Optional[float],
+    ema_ssim: Optional[float],
+) -> Tuple[float, bool, str]:
+    key = str(best_by).lower()
+    if key in ("ema", "ema_l1") and ema_val is not None:
+        return float(ema_val), False, "ema_l1"
+    if key in ("raw", "raw_l1"):
+        return float(raw_val), False, "raw_l1"
+    if key == "ema_psnr":
+        if ema_psnr is not None:
+            return float(ema_psnr), True, "ema_psnr"
+        return float(raw_psnr), True, "raw_psnr"
+    if key == "raw_psnr":
+        return float(raw_psnr), True, "raw_psnr"
+    if key == "ema_ssim":
+        if ema_ssim is not None:
+            return float(ema_ssim), True, "ema_ssim"
+        return float(raw_ssim), True, "raw_ssim"
+    if key == "raw_ssim":
+        return float(raw_ssim), True, "raw_ssim"
+    if ema_val is not None:
+        return float(ema_val), False, "ema_l1"
+    return float(raw_val), False, "raw_l1"
+
+
 def main():
     global args
     args = parse_args()
@@ -1468,6 +1539,8 @@ def main():
         "conf_qhi": args.conf_qhi,
         "conf_sup_use_quantile": args.conf_sup_use_quantile,
         "conf_sup_gamma": args.conf_sup_gamma,
+        "train_mask_mode": args.train_mask_mode,
+        "recon_mask_mode": args.recon_mask_mode,
         "device": device,
         "amp": args.amp,
         "tf32": args.tf32,
@@ -1664,14 +1737,15 @@ def main():
             min_lr_ratio=args.min_lr_ratio,
         )
     else:
+        plateau_mode = "max" if _best_is_higher(args.best_by) else "min"
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=args.plateau_factor, patience=args.plateau_patience
+            optimizer, mode=plateau_mode, factor=args.plateau_factor, patience=args.plateau_patience
         )
 
     scaler = make_grad_scaler(
         device=device, enabled=(args.amp and device == "cuda"))
 
-    best_val = float("inf")
+    best_val = _best_init(args.best_by)
     global_step = 0
     start_epoch = 0
     epochs_no_improve = 0
@@ -1718,12 +1792,18 @@ def main():
                 "[info] finetune_view_only=1 => reset epoch/global_step/best_val/no_improve.")
             start_epoch = 0
             global_step = 0
-            best_val = float("inf")
+            best_val = _best_init(args.best_by)
             epochs_no_improve = 0
         else:
             start_epoch = int(ck.get("epoch", 0))
             global_step = int(ck.get("global_step", 0))
-            best_val = float(ck.get("best_val", best_val))
+            ck_best_by = ck.get("best_by", None)
+            if ck_best_by is not None and str(ck_best_by) != str(args.best_by):
+                print(
+                    f"[warn] best_by changed ({ck_best_by} -> {args.best_by}); reset best_val.")
+                best_val = _best_init(args.best_by)
+            else:
+                best_val = float(ck.get("best_val", best_val))
             epochs_no_improve = int(ck.get("epochs_no_improve", 0))
             print(
                 f"[info] resume meta: epoch={start_epoch} global_step={global_step} best_val={best_val:.6f} no_improve={epochs_no_improve}")
@@ -1802,6 +1882,7 @@ def main():
                         conf_qlo=args.conf_qlo,
                         conf_qhi=args.conf_qhi,
                         use_conf_in_train_mask=args.use_conf_loss_gate,
+                        train_mask_mode=args.train_mask_mode,
                         pred_conf_gate=pred_conf,
                         use_conf_gate=bool(args.use_conf_gate),
                         conf_gate_detach=args.conf_gate_detach,
@@ -1809,6 +1890,7 @@ def main():
                         conf_gate_gamma=args.conf_gate_gamma,
                         conf_gate_strength=conf_gate_strength,
                         recon_gate_floor=args.recon_gate_floor,
+                        recon_mask_mode=args.recon_mask_mode,
                         recon_weight_renorm=args.recon_weight_renorm,
                         recon_weight_clip_max=args.recon_weight_clip_max,
                     )
@@ -1967,6 +2049,7 @@ def main():
                     conf_qlo=args.conf_qlo,
                     conf_qhi=args.conf_qhi,
                     use_conf_in_train_mask=args.use_conf_loss_gate,
+                    train_mask_mode=args.train_mask_mode,
                     pred_conf_gate=pred_conf,
                     use_conf_gate=bool(args.use_conf_gate),
                     conf_gate_detach=args.conf_gate_detach,
@@ -1974,6 +2057,7 @@ def main():
                     conf_gate_gamma=args.conf_gate_gamma,
                     conf_gate_strength=conf_gate_strength,
                     recon_gate_floor=args.recon_gate_floor,
+                    recon_mask_mode=args.recon_mask_mode,
                     recon_weight_renorm=args.recon_weight_renorm,
                     recon_weight_clip_max=args.recon_weight_clip_max,
                 )
@@ -2298,9 +2382,15 @@ def main():
             for row in raw_by_view:
                 print(f"  {row}")
 
-        metric_val = raw_val
-        if args.best_by == "ema" and ema_val is not None:
-            metric_val = ema_val
+        metric_val, higher_is_better, metric_name = _select_best_metric(
+            args.best_by,
+            raw_val,
+            raw_psnr,
+            raw_ssim,
+            ema_val,
+            ema_psnr,
+            ema_ssim,
+        )
 
         if args.lr_schedule == "plateau":
             prev_lr = optimizer.param_groups[0]["lr"]
@@ -2321,6 +2411,7 @@ def main():
             "val_raw": raw_val,
             "val_ema": ema_val,
             "best_by": args.best_by,
+            "best_metric": metric_name,
             "epochs_no_improve": epochs_no_improve,
             "args": vars(args),
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -2329,7 +2420,10 @@ def main():
         ckpt_last = os.path.join(args.ckpt_dir, "viewdec_ablation_last.pth")
         save_checkpoint(ckpt_last, payload)
 
-        improved = (best_val - metric_val) > float(args.min_improve)
+        if higher_is_better:
+            improved = (metric_val - best_val) > float(args.min_improve)
+        else:
+            improved = (best_val - metric_val) > float(args.min_improve)
         if improved:
             best_val = metric_val
             epochs_no_improve = 0
@@ -2340,10 +2434,11 @@ def main():
             save_checkpoint(ckpt_path, payload)
             save_checkpoint(os.path.join(
                 args.ckpt_dir, "viewdec_ablation_best.pth"), payload)
-            print(f" -> val 明显下降，保存新 best: {ckpt_path}")
+            print(
+                f" -> val improved ({metric_name}={metric_val:.6f}), saved new best: {ckpt_path}")
         else:
             epochs_no_improve += 1
-            print(f" -> val 没明显下降 (no_improve = {epochs_no_improve})")
+            print(f" -> val not improved (no_improve = {epochs_no_improve})")
 
         if args.early_stop and epochs_no_improve >= int(args.early_stop):
             print(

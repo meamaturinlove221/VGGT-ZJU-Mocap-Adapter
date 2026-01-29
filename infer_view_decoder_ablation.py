@@ -22,17 +22,23 @@ def _as_namespace(d: Optional[Dict[str, Any]]) -> SimpleNamespace:
     return SimpleNamespace(**d)
 
 
-def _pick_state_dict(ckpt: Dict[str, Any], prefer_ema: bool = True) -> Dict[str, Any]:
+def _pick_state_dict(ckpt: Dict[str, Any], prefer_ema: bool = False) -> Dict[str, Any]:
     """
     Train script saves payload:
       {"model": state_dict, "ema": state_dict or None, "args": dict, ...}
     Some other scripts might save pure state_dict.
     """
     if isinstance(ckpt, dict) and ("model" in ckpt or "ema" in ckpt):
-        if prefer_ema and ckpt.get("ema") is not None:
-            return ckpt["ema"]
-        if ckpt.get("model") is not None:
-            return ckpt["model"]
+        if prefer_ema:
+            if ckpt.get("ema") is not None:
+                return ckpt["ema"]
+            if ckpt.get("model") is not None:
+                return ckpt["model"]
+        else:
+            if ckpt.get("model") is not None:
+                return ckpt["model"]
+            if ckpt.get("ema") is not None:
+                return ckpt["ema"]
     # fallback: assume it's already a state_dict
     return ckpt
 
@@ -364,9 +370,12 @@ def main():
     parser.add_argument("--num_samples", type=int,
                         default=50, help="-1 means all")
 
-    # prefer EMA because your best is selected by EMA eval
-    parser.add_argument("--no_ema", action="store_true",
-                        help="disable EMA even if ckpt has it")
+    # default to raw weights; opt-in EMA when explicitly requested
+    ema_group = parser.add_mutually_exclusive_group()
+    ema_group.add_argument("--use_ema", action="store_true",
+                           help="use EMA weights if ckpt has them")
+    ema_group.add_argument("--no_ema", action="store_true",
+                           help="(deprecated) disable EMA even if ckpt has it")
 
     # optional overrides (otherwise taken from ckpt['args'])
     parser.add_argument("--zju_root", type=str, default=None)
@@ -492,7 +501,11 @@ def main():
     model.conf_thr = float(getattr(cfg, "conf_thr", 0.6))
     model.conf_temp = float(getattr(cfg, "conf_temp", 1.0))
 
-    sd = _pick_state_dict(ckpt, prefer_ema=(not args.no_ema))
+    prefer_ema = bool(getattr(args, "use_ema", False))
+    if (not prefer_ema) and isinstance(ckpt, dict):
+        if ckpt.get("model") is None and ckpt.get("ema") is not None:
+            print("[warn] ckpt has no raw weights; falling back to EMA.")
+    sd = _pick_state_dict(ckpt, prefer_ema=prefer_ema)
     load_state_dict_fuzzy(model, sd)
 
     model.to(device)
@@ -598,6 +611,8 @@ def main():
                     conf_qhi=float(cfg.conf_qhi),
                     use_conf_in_train_mask=bool(
                         getattr(cfg, "use_conf_loss_gate", True)),
+                    train_mask_mode=str(
+                        getattr(cfg, "train_mask_mode", "fg_conf")),
                     pred_conf_gate=pred_conf,
                     use_conf_gate=bool(getattr(cfg, "use_conf_gate", True)),
                     conf_gate_detach=bool(
@@ -609,6 +624,8 @@ def main():
                     recon_gate_floor=float(
                         getattr(cfg, "recon_gate_floor",
                                 getattr(cfg, "conf_gate_floor", 0.0))),
+                    recon_mask_mode=str(
+                        getattr(cfg, "recon_mask_mode", "fg")),
                     recon_weight_renorm=bool(
                         getattr(cfg, "recon_weight_renorm", False)),
                     recon_weight_clip_max=float(
@@ -666,6 +683,8 @@ def main():
                                 conf_qhi=float(cfg.conf_qhi),
                                 use_conf_in_train_mask=bool(
                                     getattr(cfg, "use_conf_loss_gate", True)),
+                                train_mask_mode=str(
+                                    getattr(cfg, "train_mask_mode", "fg_conf")),
                                 pred_conf_gate=pred_conf,
                                 use_conf_gate=bool(
                                     getattr(cfg, "use_conf_gate", True)),
@@ -678,6 +697,8 @@ def main():
                                 recon_gate_floor=float(
                                     getattr(cfg, "recon_gate_floor",
                                             getattr(cfg, "conf_gate_floor", 0.0))),
+                                recon_mask_mode=str(
+                                    getattr(cfg, "recon_mask_mode", "fg")),
                                 recon_weight_renorm=bool(
                                     getattr(cfg, "recon_weight_renorm", False)),
                                 recon_weight_clip_max=float(
@@ -769,7 +790,7 @@ def main():
     summary = {
         "split": cfg.split,
         "ckpt": args.ckpt,
-        "prefer_ema": (not args.no_ema),
+        "prefer_ema": prefer_ema,
         "epoch_in_ckpt": epoch,
         "step_in_ckpt": global_step,
         "N": n,

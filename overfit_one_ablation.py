@@ -54,6 +54,10 @@ def main():
     ap.add_argument('--conf_use_quantile', type=int, default=0, choices=[0, 1])
     ap.add_argument('--conf_qlo', type=float, default=0.05)
     ap.add_argument('--conf_qhi', type=float, default=0.95)
+    ap.add_argument('--train_mask_mode', type=str, default='fg_conf',
+                    choices=['fg_conf', 'valid_conf', 'valid_only'])
+    ap.add_argument('--recon_mask_mode', type=str, default='valid',
+                    choices=['fg', 'train', 'valid'])
     ap.add_argument('--recon_weight_renorm', type=int,
                     default=0, choices=[0, 1])
     ap.add_argument('--recon_weight_clip_max',
@@ -65,9 +69,9 @@ def main():
     ap.add_argument('--use_conf_gate', type=int, default=1, choices=[0, 1])
     ap.add_argument('--conf_gate_detach', type=int, default=1, choices=[0, 1])
     ap.add_argument('--conf_gate_floor', type=float, default=0.0)
-    ap.add_argument('--conf_gate_gamma', type=float, default=0.5)
-    ap.add_argument('--recon_gate_floor', type=float, default=0.2)
-    ap.add_argument('--conf_gate_warmup', type=int, default=200)
+    ap.add_argument('--conf_gate_gamma', type=float, default=2.0)
+    ap.add_argument('--recon_gate_floor', type=float, default=0.1)
+    ap.add_argument('--conf_gate_warmup', type=int, default=1000)
     ap.add_argument('--conf_gate_ramp', type=int, default=0)
     ap.add_argument('--conf_gate_ramp_mode', type=str, default='linear',
                     choices=['linear', 'cosine', 'exp'])
@@ -77,11 +81,11 @@ def main():
     ap.add_argument('--use_tone', type=int, default=0, choices=[0, 1])
     ap.add_argument('--init_alpha', type=float, default=1.0)
     ap.add_argument('--rgb_sigmoid_temp', type=float, default=1.0)
-    ap.add_argument('--conf_sigmoid_temp', type=float, default=2.0)
+    ap.add_argument('--conf_sigmoid_temp', type=float, default=1.0)
     ap.add_argument('--split_conf_head', type=int, default=0, choices=[0, 1])
     ap.add_argument('--logit_clip', type=float, default=10.0)
     ap.add_argument('--print_logits', type=int, default=0, choices=[0, 1])
-    ap.add_argument('--conf_head_lr_mult', type=float, default=0.1)
+    ap.add_argument('--conf_head_lr_mult', type=float, default=2.0)
 
     args = ap.parse_args()
 
@@ -239,6 +243,8 @@ def main():
         f'[overfit] split={split} len={len(ds)} pick index={idx} device={device} '
         f'use_conf_gate={int(bool(args.use_conf_gate))} '
         f'use_conf_loss_gate={int(bool(args.use_conf_loss_gate))} '
+        f'train_mask_mode={str(args.train_mask_mode)} '
+        f'recon_mask_mode={str(args.recon_mask_mode)} '
         f'conf_gate_detach={int(bool(args.conf_gate_detach))} '
         f'conf_gate_floor={float(args.conf_gate_floor):.3f} '
         f'conf_gate_gamma={float(args.conf_gate_gamma):.3f} '
@@ -368,6 +374,7 @@ def main():
                 conf_qlo=float(args.conf_qlo),
                 conf_qhi=float(args.conf_qhi),
                 use_conf_in_train_mask=bool(args.use_conf_loss_gate),
+                train_mask_mode=str(args.train_mask_mode),
                 pred_conf_gate=pred_conf,
                 use_conf_gate=bool(args.use_conf_gate),
                 conf_gate_detach=bool(args.conf_gate_detach),
@@ -375,6 +382,7 @@ def main():
                 conf_gate_gamma=float(args.conf_gate_gamma),
                 conf_gate_strength=float(conf_gate_strength),
                 recon_gate_floor=float(args.recon_gate_floor),
+                recon_mask_mode=str(args.recon_mask_mode),
                 recon_weight_renorm=bool(args.recon_weight_renorm),
                 recon_weight_clip_max=float(args.recon_weight_clip_max),
             )
@@ -457,6 +465,8 @@ def main():
             print(f'[stats] {_fmt_stats("recon_weight_raw", rw_raw_full, rw_raw_mask)}')
             print(f'[stats] {_fmt_stats("recon_weight", rw_full, rw_mask)} '
                   f'conf_gate_mode={aux_masks.get("conf_gate_mode", "conf_soft")} '
+                  f'train_mask_mode={aux_masks.get("train_mask_mode", "fg_conf")} '
+                  f'recon_mask_mode={aux_masks.get("recon_mask_mode", "fg")} '
                   f'renorm={int(aux_masks.get("recon_weight_renorm", 0))} '
                   f'clip_max={float(aux_masks.get("recon_weight_clip_max", 1.0)):.3f} '
                   f'gate_gamma={float(aux_masks.get("conf_gate_gamma", 1.0)):.3f}')
