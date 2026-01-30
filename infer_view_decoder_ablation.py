@@ -118,6 +118,16 @@ def build_cfg_from_ckpt_and_cli(ckpt_args: Dict[str, Any], cli: Any) -> SimpleNa
         cfg.fg_keep_largest_cc = bool(cli.fg_keep_largest_cc)
     if getattr(cli, "fg_lcc_min_pixels", None) is not None:
         cfg.fg_lcc_min_pixels = int(cli.fg_lcc_min_pixels)
+    if getattr(cli, "fg_drop_ground", None) is not None:
+        cfg.fg_drop_ground = bool(cli.fg_drop_ground)
+    if getattr(cli, "fg_ground_axis", None) is not None:
+        cfg.fg_ground_axis = int(cli.fg_ground_axis)
+    if getattr(cli, "fg_ground_q", None) is not None:
+        cfg.fg_ground_q = float(cli.fg_ground_q)
+    if getattr(cli, "fg_ground_margin", None) is not None:
+        cfg.fg_ground_margin = float(cli.fg_ground_margin)
+    if getattr(cli, "fg_ground_min_points", None) is not None:
+        cfg.fg_ground_min_points = int(cli.fg_ground_min_points)
     if getattr(cli, "use_view_cond", None) is not None:
         cfg.use_view_cond = bool(cli.use_view_cond)
     if getattr(cli, "num_views", None) is not None:
@@ -166,6 +176,16 @@ def build_cfg_from_ckpt_and_cli(ckpt_args: Dict[str, Any], cli: Any) -> SimpleNa
         cfg.fg_keep_largest_cc = True
     if not hasattr(cfg, "fg_lcc_min_pixels"):
         cfg.fg_lcc_min_pixels = 32
+    if not hasattr(cfg, "fg_drop_ground"):
+        cfg.fg_drop_ground = False
+    if not hasattr(cfg, "fg_ground_axis"):
+        cfg.fg_ground_axis = 1
+    if not hasattr(cfg, "fg_ground_q"):
+        cfg.fg_ground_q = 0.05
+    if not hasattr(cfg, "fg_ground_margin"):
+        cfg.fg_ground_margin = 0.02
+    if not hasattr(cfg, "fg_ground_min_points"):
+        cfg.fg_ground_min_points = 64
     if not hasattr(cfg, "valid_min_cover"):
         cfg.valid_min_cover = 0.10
     if not hasattr(cfg, "valid_dilate_k"):
@@ -397,6 +417,16 @@ def main():
     parser.add_argument("--conf_temp", type=float, default=None)
     parser.add_argument("--fg_keep_largest_cc", type=int, default=None, choices=[0, 1])
     parser.add_argument("--fg_lcc_min_pixels", type=int, default=None)
+    parser.add_argument("--fg_drop_ground", type=int, default=None, choices=[0, 1],
+                        help="Remove ground from fg mask using pointmap height quantile")
+    parser.add_argument("--fg_ground_axis", type=int, default=None,
+                        help="Vertical axis index in pointmap (0=x,1=y,2=z)")
+    parser.add_argument("--fg_ground_q", type=float, default=None,
+                        help="Ground height quantile within fg&valid region")
+    parser.add_argument("--fg_ground_margin", type=float, default=None,
+                        help="Margin above ground height to keep")
+    parser.add_argument("--fg_ground_min_points", type=int, default=None,
+                        help="Min fg points to estimate ground height per sample")
     parser.add_argument("--use_view_cond", nargs="?", const=1,
                         default=None, type=int, choices=[0, 1])
     parser.add_argument("--num_views", type=int, default=None)
@@ -599,6 +629,11 @@ def main():
                     fg_dilate_k=int(cfg.fg_dilate_k),
                     fg_keep_largest_cc=bool(cfg.fg_keep_largest_cc),
                     fg_lcc_min_pixels=int(cfg.fg_lcc_min_pixels),
+                    fg_drop_ground=bool(getattr(cfg, "fg_drop_ground", False)),
+                    fg_ground_axis=int(getattr(cfg, "fg_ground_axis", 1)),
+                    fg_ground_q=float(getattr(cfg, "fg_ground_q", 0.05)),
+                    fg_ground_margin=float(getattr(cfg, "fg_ground_margin", 0.02)),
+                    fg_ground_min_points=int(getattr(cfg, "fg_ground_min_points", 64)),
                     valid_min_cover=float(cfg.valid_min_cover),
                     valid_dilate_k=int(cfg.valid_dilate_k),
                     valid_k_max=int(cfg.valid_k_max),
@@ -671,6 +706,11 @@ def main():
                                 fg_dilate_k=int(cfg.fg_dilate_k),
                                 fg_keep_largest_cc=bool(cfg.fg_keep_largest_cc),
                                 fg_lcc_min_pixels=int(cfg.fg_lcc_min_pixels),
+                                fg_drop_ground=bool(getattr(cfg, "fg_drop_ground", False)),
+                                fg_ground_axis=int(getattr(cfg, "fg_ground_axis", 1)),
+                                fg_ground_q=float(getattr(cfg, "fg_ground_q", 0.05)),
+                                fg_ground_margin=float(getattr(cfg, "fg_ground_margin", 0.02)),
+                                fg_ground_min_points=int(getattr(cfg, "fg_ground_min_points", 64)),
                                 valid_min_cover=float(cfg.valid_min_cover),
                                 valid_dilate_k=int(cfg.valid_dilate_k),
                                 valid_k_max=int(cfg.valid_k_max),

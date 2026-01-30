@@ -363,6 +363,94 @@ def ensure_min_cover_by_dilation(mask_bin: torch.Tensor, min_cover: float, k0: i
         k = min(int(k_max), k * 2 + 1)
 
 
+def _safe_quantile(x: torch.Tensor, q: float) -> Optional[torch.Tensor]:
+    if x is None or x.numel() == 0:
+        return None
+    qv = float(q)
+    if qv <= 0.0:
+        return x.min()
+    if qv >= 1.0:
+        return x.max()
+    try:
+        return torch.quantile(x, qv)
+    except Exception:
+        flat = x.reshape(-1)
+        k = int(round(qv * (flat.numel() - 1)))
+        k = max(0, min(flat.numel() - 1, k))
+        return flat.kthvalue(k + 1).values
+
+
+def drop_ground_from_fg(
+    fg_mask: torch.Tensor,
+    valid_mask: Optional[torch.Tensor],
+    pointmap: Optional[torch.Tensor],
+    out_hw: Tuple[int, int],
+    axis: int = 1,
+    q: float = 0.05,
+    margin: float = 0.02,
+    min_points: int = 64,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """
+    Remove ground-like pixels from fg_mask using pointmap height quantile.
+    Assumes pointmap is (B,3,H,W) or (3,H,W) with a stable vertical axis.
+    """
+    info = {"applied": False, "floor_vals": []}
+    if fg_mask is None or pointmap is None:
+        return fg_mask, info
+
+    pm = pointmap
+    if not torch.is_tensor(pm):
+        return fg_mask, info
+    if pm.dim() == 3:
+        if pm.shape[0] == 3:
+            pm = pm.unsqueeze(0)
+        elif pm.shape[-1] == 3:
+            pm = pm.permute(2, 0, 1).unsqueeze(0)
+        else:
+            return fg_mask, info
+    elif pm.dim() == 4:
+        if pm.shape[1] != 3 and pm.shape[-1] == 3:
+            pm = pm.permute(0, 3, 1, 2)
+        elif pm.shape[1] != 3:
+            return fg_mask, info
+    else:
+        return fg_mask, info
+
+    ax = int(axis)
+    if ax < 0:
+        ax = 3 + ax
+    if ax < 0 or ax > 2:
+        return fg_mask, info
+
+    if pm.shape[-2:] != tuple(out_hw):
+        pm = F.interpolate(pm.float(), size=out_hw, mode="bilinear", align_corners=False)
+    y = pm[:, ax:ax + 1, :, :]  # (B,1,H,W)
+
+    fg_bin = (fg_mask > 0.5)
+    if valid_mask is not None:
+        fg_bin = fg_bin & (valid_mask > 0.5)
+
+    out = fg_mask.clone()
+    B = int(out.shape[0])
+    for b in range(B):
+        mb = fg_bin[b, 0]
+        if int(mb.sum().item()) < int(min_points):
+            info["floor_vals"].append(float("nan"))
+            continue
+        yb = y[b, 0][mb]
+        floor = _safe_quantile(yb, q)
+        if floor is None:
+            info["floor_vals"].append(float("nan"))
+            continue
+        floor_v = float(floor.item())
+        info["floor_vals"].append(floor_v)
+        keep = (y[b, 0] > (floor + float(margin))).float()
+        out[b, 0] = out[b, 0] * keep
+
+    info["applied"] = True
+    return out, info
+
+
 def masked_l1(pred: torch.Tensor, tgt: torch.Tensor, mask: Optional[torch.Tensor], eps=1e-6) -> torch.Tensor:
     if mask is None:
         return F.l1_loss(pred, tgt, reduction="mean")
@@ -716,6 +804,11 @@ def build_masks_from_batch(
     fg_dilate_k: int = 7,
     fg_keep_largest_cc: bool = True,
     fg_lcc_min_pixels: int = 32,
+    fg_drop_ground: Optional[bool] = None,
+    fg_ground_axis: Optional[int] = None,
+    fg_ground_q: Optional[float] = None,
+    fg_ground_margin: Optional[float] = None,
+    fg_ground_min_points: Optional[int] = None,
     valid_min_cover: float = 0.10,
     valid_dilate_k: int = 7,
     valid_k_max: int = 31,
@@ -740,6 +833,13 @@ def build_masks_from_batch(
     recon_weight_clip_max: Optional[float] = None,
 ):
     H, W = pred_hw
+
+    def _resolve_opt(value, name: str, default):
+        if value is not None:
+            return value
+        if args is not None and hasattr(args, name):
+            return getattr(args, name)
+        return default
 
     # ---- depth conf ----
     depth_conf_key, tgt_depth_conf = pick_first_tensor(
@@ -780,7 +880,7 @@ def build_masks_from_batch(
 
     # ---- fg mask ----
     fg_key, fg_raw = pick_first_tensor(
-        batch, ["fg_mask", "tgt_fg_mask", "tgt_mask", "tgt_silhouette", "silhouette",
+        batch, ["tgt_fg", "fg_mask", "tgt_fg_mask", "tgt_mask", "tgt_silhouette", "silhouette",
                 "human_mask", "person_mask", "tgt_alpha", "alpha", "seg", "tgt_seg"]
     )
 
@@ -800,6 +900,33 @@ def build_masks_from_batch(
     else:
         fg_mask0 = valid_mask.clone()
         source_fg_key = "__fallback_valid__"
+
+    # optional: remove ground using pointmap height quantile
+    source_pointmap_key = None
+    drop_ground = bool(_resolve_opt(fg_drop_ground, "fg_drop_ground", False))
+    fg_ground_axis_v = int(_resolve_opt(fg_ground_axis, "fg_ground_axis", 1))
+    fg_ground_q_v = float(_resolve_opt(fg_ground_q, "fg_ground_q", 0.05))
+    fg_ground_margin_v = float(_resolve_opt(fg_ground_margin, "fg_ground_margin", 0.02))
+    fg_ground_min_points_v = int(_resolve_opt(fg_ground_min_points, "fg_ground_min_points", 64))
+    ground_info = None
+    if drop_ground:
+        pm_key, tgt_pointmap = pick_first_tensor(
+            batch, ["tgt_pointmap", "tgt_point_map", "pointmap_tgt", "tgt_points"]
+        )
+        source_pointmap_key = pm_key
+        if tgt_pointmap is not None:
+            fg_mask0, ground_info = drop_ground_from_fg(
+                fg_mask0,
+                valid_mask,
+                tgt_pointmap.to(device),
+                out_hw=(H, W),
+                axis=fg_ground_axis_v,
+                q=fg_ground_q_v,
+                margin=fg_ground_margin_v,
+                min_points=fg_ground_min_points_v,
+            )
+        else:
+            ground_info = {"applied": False, "floor_vals": []}
 
     if fg_keep_largest_cc:
         fg_mask0 = keep_largest_connected_component(
@@ -822,13 +949,6 @@ def build_masks_from_batch(
         conf_qhi=conf_qhi,
         valid_mask=valid_mask,
     )
-    def _resolve_opt(value, name: str, default):
-        if value is not None:
-            return value
-        if args is not None and hasattr(args, name):
-            return getattr(args, name)
-        return default
-
     conf_soft = conf_soft.clamp(0, 1) * valid_mask
     conf_gate_mode = "conf_soft"
     if not use_conf_in_train_mask:
@@ -978,6 +1098,16 @@ def build_masks_from_batch(
         "source_fg_key": source_fg_key,
         "source_valid_key": source_valid_key,
         "source_depth_conf_key": depth_conf_key,
+        "source_pointmap_key": source_pointmap_key,
+        "fg_drop_ground": bool(drop_ground),
+        "fg_ground_axis": int(fg_ground_axis_v),
+        "fg_ground_q": float(fg_ground_q_v),
+        "fg_ground_margin": float(fg_ground_margin_v),
+        "fg_ground_min_points": int(fg_ground_min_points_v),
+        "fg_ground_applied": bool(
+            ground_info.get("applied", False) if isinstance(ground_info, dict) else False
+        ),
+        "fg_ground_floor": (ground_info.get("floor_vals") if isinstance(ground_info, dict) else None),
     }
     return train_mask, valid_mask, fg_mask, recon_weight, tgt_depth_conf, aux
 
@@ -1246,6 +1376,19 @@ def ema_update(ema_model: nn.Module, model: nn.Module, decay: float):
     ema_model.load_state_dict(esd, strict=False)
 
 
+@torch.no_grad()
+def ema_sanity_check(model: nn.Module, ema_model: nn.Module):
+    msd = model.state_dict()
+    esd = ema_model.state_dict()
+    for k, v in msd.items():
+        if k in esd and torch.is_tensor(v) and torch.is_tensor(esd[k]):
+            diff = (v.detach() - esd[k].detach()).abs().max().item()
+            print(f"[info] ema sanity: key={k} max_abs_diff={diff:.6e}")
+            return diff
+    print("[warn] ema sanity: no common tensor keys found.")
+    return None
+
+
 # ---------------------------
 # Args
 # ---------------------------
@@ -1388,6 +1531,19 @@ def parse_args():
     p.add_argument("--fg_dilate_k", type=int, default=7)
     p.add_argument("--fg_keep_largest_cc", type=int, default=1, choices=[0, 1])
     p.add_argument("--fg_lcc_min_pixels", type=int, default=32)
+    p.add_argument("--fg_drop_ground", dest="fg_drop_ground",
+                   action="store_true", help="Remove ground from fg mask using pointmap height quantile")
+    p.add_argument("--no_fg_drop_ground", dest="fg_drop_ground",
+                   action="store_false", help="Disable pointmap ground removal for fg mask")
+    p.set_defaults(fg_drop_ground=True)
+    p.add_argument("--fg_ground_axis", type=int, default=1,
+                   help="Vertical axis index in pointmap (0=x,1=y,2=z)")
+    p.add_argument("--fg_ground_q", type=float, default=0.05,
+                   help="Ground height quantile within fg&valid region")
+    p.add_argument("--fg_ground_margin", type=float, default=0.02,
+                   help="Margin above ground height to keep (same units as pointmap)")
+    p.add_argument("--fg_ground_min_points", type=int, default=64,
+                   help="Min fg points to estimate ground height per sample")
     p.add_argument("--valid_min_cover", type=float, default=0.10)
     p.add_argument("--valid_dilate_k", type=int, default=7)
     p.add_argument("--valid_k_max", type=int, default=31)
@@ -1541,6 +1697,10 @@ def main():
         "conf_sup_gamma": args.conf_sup_gamma,
         "train_mask_mode": args.train_mask_mode,
         "recon_mask_mode": args.recon_mask_mode,
+        "fg_drop_ground": args.fg_drop_ground,
+        "fg_ground_axis": args.fg_ground_axis,
+        "fg_ground_q": args.fg_ground_q,
+        "fg_ground_margin": args.fg_ground_margin,
         "device": device,
         "amp": args.amp,
         "tf32": args.tf32,
@@ -1665,8 +1825,14 @@ def main():
         ema_model = copy.deepcopy(model).eval()
         for p in ema_model.parameters():
             p.requires_grad = False
-        ema_model.load_state_dict(model.state_dict(), strict=False)
-        print("[info] ema initialized from model (hard copy).")
+        try:
+            ema_model.load_state_dict(model.state_dict(), strict=True)
+            print("[info] ema initialized from model (hard copy, strict=True).")
+        except Exception as e:
+            print(f"[warn] ema strict load failed: {e}")
+            ema_model.load_state_dict(model.state_dict(), strict=False)
+            print("[info] ema initialized from model (hard copy, strict=False).")
+        ema_sanity_check(model, ema_model)
 
     percep_loss_fn = VGGPerceptualLoss(slice_to=16).to(device)
 
@@ -1808,7 +1974,14 @@ def main():
             print(
                 f"[info] resume meta: epoch={start_epoch} global_step={global_step} best_val={best_val:.6f} no_improve={epochs_no_improve}")
 
-    def run_val(eval_model: nn.Module, *, save_debug: bool, tag: str, collect_by_view: bool = False):
+    def run_val(
+        eval_model: nn.Module,
+        *,
+        save_debug: bool,
+        tag: str,
+        collect_by_view: bool = False,
+        conf_gate_strength_override: Optional[float] = None,
+    ):
         eval_model.eval()
         val_sum = 0.0
         val_cnt = 0
@@ -1843,7 +2016,9 @@ def main():
                     src_vids = src_vids.to(device, non_blocking=True)
 
                 with autocast_ctx(device=device, enabled=(args.amp and device == "cuda")):
-                    conf_gate_strength = _conf_gate_strength(global_step)
+                    conf_gate_strength = conf_gate_strength_override
+                    if conf_gate_strength is None:
+                        conf_gate_strength = _conf_gate_strength(global_step)
                     pred_rgb, pred_conf, aux_pred = eval_model(
                         src_imgs,
                         src_depth,
@@ -1871,6 +2046,11 @@ def main():
                         fg_dilate_k=args.fg_dilate_k,
                         fg_keep_largest_cc=args.fg_keep_largest_cc,
                         fg_lcc_min_pixels=args.fg_lcc_min_pixels,
+                        fg_drop_ground=args.fg_drop_ground,
+                        fg_ground_axis=args.fg_ground_axis,
+                        fg_ground_q=args.fg_ground_q,
+                        fg_ground_margin=args.fg_ground_margin,
+                        fg_ground_min_points=args.fg_ground_min_points,
                         valid_min_cover=args.valid_min_cover,
                         valid_dilate_k=args.valid_dilate_k,
                         valid_k_max=args.valid_k_max,
@@ -2038,6 +2218,11 @@ def main():
                     fg_dilate_k=args.fg_dilate_k,
                     fg_keep_largest_cc=args.fg_keep_largest_cc,
                     fg_lcc_min_pixels=args.fg_lcc_min_pixels,
+                    fg_drop_ground=args.fg_drop_ground,
+                    fg_ground_axis=args.fg_ground_axis,
+                    fg_ground_q=args.fg_ground_q,
+                    fg_ground_margin=args.fg_ground_margin,
+                    fg_ground_min_points=args.fg_ground_min_points,
                     valid_min_cover=args.valid_min_cover,
                     valid_dilate_k=args.valid_dilate_k,
                     valid_k_max=args.valid_k_max,
@@ -2349,12 +2534,15 @@ def main():
         # Val
         # ---------------------------
         model.eval()
+        val_gate_strength = _conf_gate_strength(global_step)
         raw_val, raw_psnr, raw_ssim, raw_by_view = run_val(
-            model, save_debug=True, tag="raw", collect_by_view=True)
+            model, save_debug=True, tag="raw", collect_by_view=True,
+            conf_gate_strength_override=val_gate_strength)
         ema_val, ema_psnr, ema_ssim = None, None, None
         if args.use_ema and ema_model is not None:
             ema_val, ema_psnr, ema_ssim, _ = run_val(
-                ema_model, save_debug=False, tag="ema", collect_by_view=False)
+                ema_model, save_debug=False, tag="ema", collect_by_view=False,
+                conf_gate_strength_override=val_gate_strength)
 
         if ema_val is not None:
             print(

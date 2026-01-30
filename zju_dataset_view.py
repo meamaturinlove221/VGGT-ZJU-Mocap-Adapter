@@ -238,6 +238,18 @@ class ZJUViewSynthDataset(Dataset):
         conf = np.clip(conf, 0.0, 1.0)
         return conf
 
+    def _normalize_mask(self, mask: np.ndarray) -> np.ndarray:
+        """Normalize mask to float32 [0,1] before binarization."""
+        m = mask.astype(np.float32, copy=False)
+        if m.size == 0:
+            return m
+        if not np.isfinite(m).all():
+            m = np.nan_to_num(m, nan=0.0, posinf=0.0, neginf=0.0)
+        maxv = float(m.max())
+        if maxv > 1.5:
+            m = m / 255.0
+        return np.clip(m, 0.0, 1.0)
+
     def _assert_depth_shapes(self, d, c, pm, geom_path, view_idx, view_id, role):
         if d.ndim != 2 or c.ndim != 2 or pm.ndim != 3 or pm.shape[-1] != 3:
             raise ValueError(
@@ -341,8 +353,11 @@ class ZJUViewSynthDataset(Dataset):
         if tgt_mask_pil.size != tgt_img_pil.size:
             tgt_mask_pil = tgt_mask_pil.resize(
                 tgt_img_pil.size, resample=Image.NEAREST)
-        tgt_mask = torch.from_numpy(np.array(tgt_mask_pil)).float()
-        tgt_fg = (tgt_mask > 0).float()
+        tgt_mask_np = np.array(tgt_mask_pil)
+        tgt_mask_np = self._normalize_mask(tgt_mask_np)
+        tgt_mask = torch.from_numpy(tgt_mask_np).float()
+        # ensure binary {0,1} foreground mask
+        tgt_fg = (tgt_mask > 0.5).float()
 
         d = self._process_depth_like(depth[tgt_idx])
         c = self._normalize_conf(self._process_depth_like(depth_conf[tgt_idx]))
