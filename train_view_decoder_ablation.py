@@ -95,7 +95,7 @@ class IniLogger:
 # ---------------------------
 # Torch / cuDNN stability
 # ---------------------------
-def setup_torch_stability(tf32: bool = True):
+def setup_torch_stability(tf32: bool = True, cudnn_benchmark: bool = True):
     if torch.cuda.is_available():
         try:
             torch.backends.cuda.matmul.fp32_precision = "tf32" if tf32 else "ieee"
@@ -107,7 +107,7 @@ def setup_torch_stability(tf32: bool = True):
             except Exception:
                 pass
 
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.benchmark = bool(cudnn_benchmark)
     torch.backends.cudnn.deterministic = False
     try:
         torch.set_float32_matmul_precision("high")
@@ -1400,12 +1400,12 @@ def parse_args():
     p.add_argument("--seq_names", type=str, default="CoreView_390",
                    help="comma separated, e.g. CoreView_390,CoreView_392")
 
-    p.add_argument("--batch_size", type=int, default=3)
+    p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--accum_steps", type=int, default=1,
                    help="gradient accumulation steps")
 
-    p.add_argument("--num_workers_train", type=int, default=4)
-    p.add_argument("--num_workers_val", type=int, default=0)
+    p.add_argument("--num_workers_train", type=int, default=8)
+    p.add_argument("--num_workers_val", type=int, default=4)
 
     p.add_argument("--epochs", type=int, default=130)
     p.add_argument("--lr", type=float, default=5e-5)
@@ -1429,6 +1429,10 @@ def parse_args():
     p.add_argument("--tf32", dest="tf32", action="store_true")
     p.add_argument("--no_tf32", dest="tf32", action="store_false")
     p.set_defaults(tf32=True)
+
+    p.add_argument("--cudnn_benchmark", dest="cudnn_benchmark", action="store_true")
+    p.add_argument("--no_cudnn_benchmark", dest="cudnn_benchmark", action="store_false")
+    p.set_defaults(cudnn_benchmark=True)
 
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--grad_clip", type=float, default=1.0)
@@ -1661,7 +1665,7 @@ def main():
     args = parse_args()
     args.use_view_cond = bool(args.use_view_cond)
     args.finetune_view_only = bool(args.finetune_view_only)
-    setup_torch_stability(tf32=args.tf32)
+    setup_torch_stability(tf32=args.tf32, cudnn_benchmark=args.cudnn_benchmark)
     seed_everything(args.seed)
 
     seq_names = _normalize_seq_names(args.seq_names)
@@ -1704,6 +1708,7 @@ def main():
         "device": device,
         "amp": args.amp,
         "tf32": args.tf32,
+        "cudnn_benchmark": args.cudnn_benchmark,
         "use_ema": args.use_ema,
         "ema_decay": args.ema_decay,
         "best_by": args.best_by,

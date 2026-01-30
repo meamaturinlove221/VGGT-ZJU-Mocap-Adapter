@@ -27,7 +27,7 @@ class DynamicTorchDataset(ABC):
         worker_init_fn: Optional[Callable] = None,
         persistent_workers: bool = False,
         seed: int = 42,
-        max_img_per_gpu: int = 48,
+        max_img_per_gpu: int = 96,
     ) -> None:
         self.dataset_config = dataset
         self.common_config = common_config
@@ -102,7 +102,7 @@ class DynamicBatchSampler(Sampler):
                  image_num_range,
                  epoch=0,
                  seed=42,
-                 max_img_per_gpu=48):
+                 max_img_per_gpu=96):
         """
         Initializes the dynamic batch sampler.
 

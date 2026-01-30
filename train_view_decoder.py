@@ -71,8 +71,8 @@ def main():
         # "CoreView_386",
     ]
 
-    batch_size = 3
-    num_workers = 4
+    batch_size = 8
+    num_workers = 8
 
     # 感知损失 / 亮度 / 对比度 / conf 的权重
     lambda_percep = 0.05       # 比之前 0.1 更弱一些
@@ -130,6 +130,17 @@ def main():
 
     # ---------- 2) 模型 & 优化器 ----------
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cuda":
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        except Exception:
+            pass
+        torch.backends.cudnn.benchmark = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
     model = GeomViewDecoder().to(device)
 
     percep_loss_fn = VGGPerceptualLoss().to(device)

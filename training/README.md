@@ -85,7 +85,7 @@ The ratio of different datasets can be controlled by setting `len_train`. For ex
 If you encounter out-of-memory (OOM) errors on your GPU, consider adjusting the following parameters in `training/config/default.yaml`:
 
 - `max_img_per_gpu`: Reduce this value to decrease the batch size per GPU
-- `accum_steps`: Sets the number of gradient accumulation steps (default is 2). This feature splits batches into smaller chunks to save memory, though it may slightly increase training time. Note that gradient accumulation was not used for the original VGGT model.
+- `accum_steps`: Sets the number of gradient accumulation steps (default is 1). This feature splits batches into smaller chunks to save memory, though it may slightly increase training time. Note that gradient accumulation was not used for the original VGGT model.
 
 ### Learning Rate Tuning
 

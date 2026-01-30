@@ -92,7 +92,7 @@ def _mk_run_name(run_name: str | None) -> str:
 
 
 @app.function(
-    gpu=["H100", "A100"],
+    gpu="A100",
     timeout=86400,  # 7 天；你要更久就自己改大
     volumes={
         "/mnt/zju": vol_data,  # 数据卷
@@ -104,8 +104,10 @@ def train_one(
     run_name: str = "",
     # 默认 epochs 给超大值，相当于“没有上限”，直到你手动停 / 或到 timeout
     epochs: int = 999999,
-    batch_size: int = 5,
+    batch_size: int = 8,
     accum_steps: int = 1,
+    num_workers_train: int = 8,
+    num_workers_val: int = 4,
     # 为了避免你这次在 keep_largest_cc 上卡死，默认关掉
     fg_keep_largest_cc: int = 0,
     # 这些你现在代码里有（你也可以不改默认，只当透传开关）
@@ -144,6 +146,8 @@ def train_one(
         "--epochs", str(int(epochs)),
         "--batch_size", str(int(batch_size)),
         "--accum_steps", str(int(accum_steps)),
+        "--num_workers_train", str(int(num_workers_train)),
+        "--num_workers_val", str(int(num_workers_val)),
         "--fg_keep_largest_cc", str(int(fg_keep_largest_cc)),
     ]
 
@@ -170,8 +174,10 @@ def main(
     seq_names: str = "CoreView_390",
     run_name: str = "",
     epochs: int = 999999,
-    batch_size: int = 5,
+    batch_size: int = 8,
     accum_steps: int = 1,
+    num_workers_train: int = 8,
+    num_workers_val: int = 4,
     fg_keep_largest_cc: int = 0,
     train_mask_mode: str = "",
     recon_mask_mode: str = "",
@@ -183,6 +189,8 @@ def main(
         epochs=epochs,
         batch_size=batch_size,
         accum_steps=accum_steps,
+        num_workers_train=num_workers_train,
+        num_workers_val=num_workers_val,
         fg_keep_largest_cc=fg_keep_largest_cc,
         train_mask_mode=train_mask_mode,
         recon_mask_mode=recon_mask_mode,

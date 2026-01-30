@@ -3,13 +3,14 @@ data:
   # The code still looks too complicated. I should refactor this again (do I have time?...)
   train:
     _target_: data.dynamic_dataloader.DynamicTorchDataset
-    num_workers: 8
-    max_img_per_gpu: 48
+    num_workers: 16
+    max_img_per_gpu: 96
     # Shuffling in PyTorch DataLoader can sometimes copy large dicts and exceed CPU memory
     # (see: https://github.com/pytorch/pytorch/issues/13246).
     # To avoid this, set shuffle=False and enable common_config.inside_random=True instead.
     shuffle: True
-    pin_memory: False
+    pin_memory: True
+    persistent_workers: True
     common_config:  # common config for evaluation
       fix_img_num: -1 # -1 means do not fix the number of images
       fix_aspect_ratio: 1.0
@@ -26,7 +27,7 @@ data:
       get_nearby: True
       load_depth: True
       img_nums: [2, 24]
-      max_img_per_gpu: 48
+      max_img_per_gpu: 96
       allow_duplicate_img: True
       repeat_batch: False
 
@@ -45,13 +46,14 @@ data:
         gau_blur: False
   val:
     _target_: data.dynamic_dataloader.DynamicTorchDataset
-    num_workers: 8
-    max_img_per_gpu: 48
+    num_workers: 16
+    max_img_per_gpu: 96
     # Shuffling in PyTorch DataLoader can sometimes copy large dicts and exceed CPU memory
     # (see: https://github.com/pytorch/pytorch/issues/13246).
     # To avoid this, set shuffle=False and enable common_config.inside_random=True instead.
     shuffle: True
-    pin_memory: False
+    pin_memory: True
+    persistent_workers: True
     common_config:  # common config for evaluation
       fix_img_num: -1 # -1 means do not fix the number of images
       fix_aspect_ratio: 1.0

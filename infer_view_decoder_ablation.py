@@ -385,8 +385,8 @@ def main():
     parser.add_argument("--out_dir", type=str, default="infer_vis")
 
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--num_samples", type=int,
                         default=50, help="-1 means all")
 
@@ -454,6 +454,8 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
 
     # --- load ckpt ---
     # 或者直接 load_checkpoint(args.ckpt, "cpu")

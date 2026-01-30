@@ -3,12 +3,12 @@ defaults:
 
 exp_name: exp001
 img_size: 518
-num_workers: 8
+num_workers: 16
 seed_value: 42
-accum_steps: 2    # We did not use gradient accumulation in our training, while if you suffer from OOM, you can try to use it.
+accum_steps: 1    # We did not use gradient accumulation in our training, while if you suffer from OOM, you can try to use it.
 patch_size: 14
 val_epoch_freq: 5
-max_img_per_gpu: 48
+max_img_per_gpu: 96
 
 limit_train_batches: 800
 limit_val_batches: 400
@@ -179,5 +179,5 @@ distributed:
 
 cuda:
     cudnn_deterministic: False
-    cudnn_benchmark: False
+    cudnn_benchmark: True
     allow_tf32: True

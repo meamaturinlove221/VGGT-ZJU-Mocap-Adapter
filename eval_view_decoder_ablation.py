@@ -184,8 +184,8 @@ def main():
     parser.add_argument("--train_script", type=str, default="train_view_decoder_ablation.py")
     parser.add_argument("--split", type=str, default="val", choices=["train", "val", "test"])
     parser.add_argument("--out_dir", type=str, default=r"runs\eval_viewdec")
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--use_ema", action="store_true", help="强制用 ema 权重（若有）")
     parser.add_argument("--no_ema", action="store_true", help="强制不用 ema 权重")
@@ -205,6 +205,8 @@ def main():
         torch.backends.cudnn.conv.fp32_precision = "tf32"
     except Exception:
         pass
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
 
     # 1) 动态导入训练脚本（复用其定义）
     train_mod = import_train_module(args.train_script)

@@ -19,8 +19,8 @@ SEQ_NAMES = [
 # 换成你当前想看的 ckpt
 CKPT_PATH = r"F:\vggt\ckpts\viewdec_best_epoch02.pth"
 
-BATCH_SIZE = 4
-NUM_WORKERS = 4
+BATCH_SIZE = 8
+NUM_WORKERS = 8
 USE_FP16 = True   # 先关掉半精度排查（True/False 自己切）
 
 # 输出目录
@@ -96,6 +96,7 @@ def main():
 
     # ---------- 2) 模型 & checkpoint ----------
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    amp_dtype = torch.bfloat16 if (device == "cuda" and torch.cuda.get_device_capability()[0] >= 8) else torch.float16
     model = GeomViewDecoder().to(device)
 
     print(">>> Using checkpoint:", CKPT_PATH)
@@ -117,7 +118,7 @@ def main():
 
             # 可选的 fp16 推理
             if USE_FP16 and device == "cuda":
-                with torch.cuda.amp.autocast(dtype=torch.float16):
+                with torch.cuda.amp.autocast(dtype=amp_dtype):
                     pred_rgb, pred_conf = model(
                         src_imgs, src_depth, src_depth_conf, src_pointmap
                     )
