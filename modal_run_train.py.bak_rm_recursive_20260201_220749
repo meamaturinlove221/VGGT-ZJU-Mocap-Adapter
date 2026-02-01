@@ -1,10 +1,8 @@
-# modal_run_train.py
-# Modal runner for VGGT view-decoder training on ZJU-MoCap (CoreView_390 etc.)
-#
-# What this runner guarantees:
-# - Data volume mounted ONLY once at /mnt/data (avoids "same Volume mounted multiple locations" error)
-# - Auto-detects zju_root in the *remote container* by locating <seq>/vggt_geom
-# - Always passes --zju_root to train_view_decoder_ablation.py to avoid Windows default path
+# /mnt/data/modal_run_train.py
+# Modal runner for view-decoder ablation training (VGGT / ZJU-MoCap)
+# - Pass-through optimizer/scheduler/early-stop args
+# - Defaults tuned to avoid long-run drift (cosine + warmup + min_lr_ratio + early_stop)
+# - Filters unknown flags by parsing `train_view_decoder_ablation.py --help` (so version mismatch won't silently hurt)
 
 import os
 import re
@@ -14,7 +12,7 @@ import time
 import shlex
 import subprocess
 from dataclasses import dataclass, asdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import modal
 
@@ -36,7 +34,7 @@ out_vol = modal.Volume.from_name(VOL_OUT_NAME,  create_if_missing=True)
 
 
 # --------------------------
-# GPU mapping (string interface stable)
+# GPU mapping (best-effort; keep string interface stable)
 # --------------------------
 def _resolve_gpu(gpu: str):
     g = (gpu or "").lower().strip()
@@ -48,18 +46,16 @@ def _resolve_gpu(gpu: str):
         return "H100"
     if g in ("l40s", "l40"):
         return "L40S"
+    # fallback
     return "A100-80GB"
 
 
 # --------------------------
-# Image
+# Image (keep minimal; your codebase likely vendors deps in repo env, but we keep common ones)
+# If your project uses a prebuilt image, replace here.
 # --------------------------
-# Note:
-# - Do NOT put extra pip args inside .pip_install() list, Modal will reject that.
-# - Install torch via .run_commands() with an index-url.
 image = (
     modal.Image.debian_slim(python_version="3.10")
-    .apt_install("git", "ffmpeg", "libgl1", "libglib2.0-0")
     .pip_install(
         "numpy",
         "pillow",
@@ -68,11 +64,8 @@ image = (
         "einops",
         "opencv-python-headless",
     )
-    .run_commands(
-        "python -m pip install --no-cache-dir torch torchvision "
-        "--index-url https://download.pytorch.org/whl/cu121"
-    )
-    .add_local_dir(_CODE_DIR, remote_path=MNT_CODE)
+    # Bundle local code into the image (Modal SDK v1+ recommended)
+    .add_local_dir(_CODE_DIR, remote_path=MNT_CODE, recursive=True)
 )
 
 app = modal.App("vggt-viewdec-train")
@@ -80,14 +73,17 @@ app = modal.App("vggt-viewdec-train")
 
 # --------------------------
 # Helper: parse argparse --help to learn which flags exist and which take a value
+# This prevents accidental "unknown arg" crash or silent mismatch.
 # --------------------------
 _HELP_OPT_LINE = re.compile(
-    r"^\s{0,4}(-\w,\s*)?(--[A-Za-z0-9][A-Za-z0-9_-]*)(\s+[^-\s].*)?$"
-)
+    r"^\s{0,4}(-\w,\s*)?(--[A-Za-z0-9][A-Za-z0-9_-]*)(\s+[^-\s].*)?$")
 
 
 def _parse_help_options(help_text: str) -> Dict[str, bool]:
-    """Returns { '--flag': takes_value_bool } (best-effort argparse help parsing)."""
+    """
+    Returns { '--flag': takes_value_bool }
+    Best-effort parsing of argparse help output.
+    """
     specs: Dict[str, bool] = {}
     for line in help_text.splitlines():
         m = _HELP_OPT_LINE.match(line)
@@ -95,21 +91,21 @@ def _parse_help_options(help_text: str) -> Dict[str, bool]:
             continue
         flag = m.group(2)
         tail = (m.group(3) or "").strip()
-        if not tail or tail.startswith("["):
-            takes_value = False
-        else:
-            first = tail.split()[0]
-            takes_value = (
-                first.startswith("{")
-                or first.startswith("<")
-                or bool(re.match(r"^[A-Z0-9_]+$", first))
-            )
+        # If there's a metavar-ish token right after the flag, assume it takes a value.
+        # Examples:
+        #   --lr LR
+        #   --lr_schedule {none,cosine,...}
+        #   --holdout_view_ids HOLDOUT_VIEW_IDS
+        takes_value = bool(tail) and not tail.startswith("[")
         specs[flag] = takes_value
     return specs
 
 
 def _filter_args_by_help(py: str, script: str, args: List[str]) -> List[str]:
-    """Keep only flags supported by the target script; drop unknown. Keep values only when needed."""
+    """
+    Keeps only flags supported by the target script; drops unknown.
+    Also keeps values only when the flag is detected to take a value.
+    """
     cmd = [py, script, "--help"]
     try:
         out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True)
@@ -126,6 +122,7 @@ def _filter_args_by_help(py: str, script: str, args: List[str]) -> List[str]:
         a = args[i]
         if a.startswith("--"):
             if a not in supported:
+                # drop unknown flag and (optionally) its following token if it looks like a value
                 nxt = args[i + 1] if (i + 1) < len(args) else None
                 if nxt is not None and not nxt.startswith("--"):
                     print(f"[drop] {a} {nxt}")
@@ -137,6 +134,7 @@ def _filter_args_by_help(py: str, script: str, args: List[str]) -> List[str]:
 
             filtered.append(a)
             if specs.get(a, False):
+                # expects a value
                 if (i + 1) >= len(args) or args[i + 1].startswith("--"):
                     raise RuntimeError(
                         f"flag {a} expects a value, but none provided")
@@ -145,6 +143,7 @@ def _filter_args_by_help(py: str, script: str, args: List[str]) -> List[str]:
             else:
                 i += 1
         else:
+            # positional / stray token
             filtered.append(a)
             i += 1
 
@@ -156,11 +155,7 @@ def _filter_args_by_help(py: str, script: str, args: List[str]) -> List[str]:
 # --------------------------
 @dataclass
 class TrainConfig:
-    # data root (REMOTE path). Leave empty to auto-detect under /mnt/data.
-    zju_root: str = ""
-
     # core
-    # comma separated, e.g. "CoreView_390,CoreView_392"
     seq_names: str = "CoreView_390"
     epochs: int = 50
     batch_size: int = 3
@@ -168,201 +163,80 @@ class TrainConfig:
     lr: float = 5e-5
 
     # schedule / convergence
-    lr_schedule: str = "cosine"      # cosine|plateau
+    # none|cosine|cosine_restart|step (script decides)
+    lr_schedule: str = "cosine"
     warmup_steps: int = 400
     min_lr_ratio: float = 0.1
-    early_stop: int = 15             # 0 disable
 
-    # best selection
+    # stop when best metric doesn't improve for N epochs (0 = disable)
+    early_stop: int = 15
+
+    # eval / saving
+    eval_every: int = 1
+    save_every: int = 1
+    # keep EMA from "early best" unless you explicitly opt in
     best_by: str = "raw_psnr"        # raw_psnr|ema_psnr|raw_ssim|ema_ssim|raw|ema
-
-    # ema
     use_ema: bool = True
     ema_decay: float = 0.99
     ema_start_step: int = 0
 
-    # conf / gate
+    # conf / gate (keep your current defaults; tune in this file if needed)
     split_conf_head: bool = True
     conf_head_lr_mult: float = 2.0
+    # if supported: linearly ramp conf gate 0->1 after warmup
     conf_gate_warmup: int = 400
-    conf_sigmoid_temp: float = 1.0
+    conf_sigmoid_temp: float = 1.0   # if supported
 
-    # data / masks
+    # data / mask behavior
     bg_weight: float = 0.05
-    train_mask_mode: str = "fg_conf"
-    recon_mask_mode: str = "valid"
+    train_mask_mode: str = "fg_conf"   # fg_conf|valid_conf|valid_only (script decides)
+    recon_mask_mode: str = "valid"     # fg|train|valid (script decides)
     recon_weight_renorm: bool = True
     recon_weight_clip_max: float = 1.0
     conf_use_quantile: bool = True
     conf_qlo: float = 0.05
     conf_qhi: float = 0.95
 
-    # precision
+    # misc
     amp: bool = True
     tf32: bool = True
-
-    # workers (train script可能是 num_workers_train/val；这里两套都传，help-filter 会保留它认识的)
     num_workers: int = 4
-    num_workers_train: int = 4
-    num_workers_val: int = 0
+    seed: int = 0
 
-    # holdout views
-    holdout_view_ids: str = ""
+    # view split / holdout (CSV string; script decides)
+    holdout_view_ids: str = ""       # e.g. "0" or "0,1"; empty means script default
 
     # debug
     debug_train_every: int = 200
     debug_val_every_epoch: bool = True
     split_cat_panels: bool = True
 
-    # extra args appended verbatim to training script cmdline
-    extra_train_args: str = ""
-
     # runner
     train_script: str = "train_view_decoder_ablation.py"
     gpu: str = "a100-80g"
-    timeout_sec: int = 86400         # Modal hard limit
+    timeout_sec: int = 86400         # Modal hard limit: <= 86400
 
 
 def _truthy(x: str) -> bool:
-    return (x or "").strip().lower() in ("1", "true", "yes", "y", "on")
+    return x.strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 def _make_run_tag() -> str:
     return time.strftime("%Y%m%d_%H%M%S")
 
 
-def _split_seq_names(seq_names: str) -> List[str]:
-    if not seq_names:
-        return []
-    if "," in seq_names:
-        return [s.strip() for s in seq_names.split(",") if s.strip()]
-    return [seq_names.strip()]
-
-
-def _is_windows_path(p: str) -> bool:
-    if not p:
-        return False
-    # e.g. "F:\datasets\..."
-    return bool(re.match(r"^[A-Za-z]:\\", p))
-
-
-def _candidate_roots(zju_root_hint: str) -> List[str]:
-    cands: List[str] = []
-    hint = (zju_root_hint or "").strip()
-
-    if hint:
-        # If user passed relative (like "zju_mocap"), interpret under /mnt/data.
-        if _is_windows_path(hint):
-            # remote container cannot use this; keep it but it'll fail the dir checks and we fall back
-            cands.append(hint)
-        elif hint.startswith("/"):
-            cands.append(hint)
-        else:
-            cands.append(os.path.join(MNT_DATA, hint))
-
-    # Common layouts under /mnt/data
-    cands += [
-        os.path.join(MNT_DATA, "zju_mocap"),
-        os.path.join(MNT_DATA, "ZJU_MoCap", "data", "zju_mocap"),
-        os.path.join(MNT_DATA, "datasets", "zju_mocap"),
-        os.path.join(MNT_DATA, "data", "zju_mocap"),
-        MNT_DATA,
-    ]
-
-    # de-dup while preserving order
-    seen = set()
-    out = []
-    for p in cands:
-        if p not in seen:
-            seen.add(p)
-            out.append(p)
-    return out
-
-
-def _find_zju_root_remote(seq_list: List[str], zju_root_hint: str) -> str:
-    """
-    Find a directory 'root' such that for ALL seq in seq_list, root/seq/vggt_geom exists.
-    """
-    if not seq_list:
-        raise RuntimeError("seq_names is empty; cannot locate zju_root.")
-
-    # 1) try curated candidates first
-    for root in _candidate_roots(zju_root_hint):
-        ok = True
-        for seq in seq_list:
-            geom = os.path.join(root, seq, "vggt_geom")
-            if not os.path.isdir(geom):
-                ok = False
-                break
-        if ok:
-            return root
-
-    # 2) shallow search: look one level under /mnt/data
-    try:
-        top = [d for d in os.listdir(MNT_DATA)]
-    except Exception:
-        top = []
-
-    top_dirs = []
-    for d in top:
-        p = os.path.join(MNT_DATA, d)
-        if os.path.isdir(p):
-            top_dirs.append(p)
-
-    # Try patterns: /mnt/data/<X>/zju_mocap, /mnt/data/<X>
-    pattern_roots = []
-    for td in top_dirs:
-        pattern_roots.append(td)
-        pattern_roots.append(os.path.join(td, "zju_mocap"))
-        pattern_roots.append(os.path.join(td, "data", "zju_mocap"))
-
-    seen = set()
-    pattern_roots2 = []
-    for p in pattern_roots:
-        if p not in seen:
-            seen.add(p)
-            pattern_roots2.append(p)
-
-    for root in pattern_roots2:
-        ok = True
-        for seq in seq_list:
-            geom = os.path.join(root, seq, "vggt_geom")
-            if not os.path.isdir(geom):
-                ok = False
-                break
-        if ok:
-            return root
-
-    # 3) fail with helpful diagnostics
-    listing = ""
-    try:
-        listing = "\n".join(sorted(os.listdir(MNT_DATA))[:200])
-    except Exception as e:
-        listing = f"(failed to list {MNT_DATA}: {e})"
-
-    msg = (
-        "[auto-zju-root] Could not locate zju_root under /mnt/data.\n"
-        f"Need: <zju_root>/{seq_list[0]}/vggt_geom (and all other seqs).\n"
-        "Checked common candidates and shallow /mnt/data/* patterns.\n"
-        "Top entries under /mnt/data (first 200):\n"
-        + listing
-        + "\n\n"
-        "Fix options:\n"
-        "  A) Put your dataset into the data volume so that /mnt/data/<something>/<SEQ>/vggt_geom exists.\n"
-        "  B) Set env VGGT_ZJU_ROOT to the correct remote path (e.g. /mnt/data/zju_mocap).\n"
-    )
-    raise FileNotFoundError(msg)
-
-
 def _build_train_args(cfg: TrainConfig, run_tag: str) -> List[str]:
-    log_dir = f"{MNT_OUT}/vggt/runs/{cfg.seq_names}_{run_tag}"
+    """
+    Assemble argv for train_view_decoder_ablation.py.
+    IMPORTANT: We only include args likely supported; unknown ones will be filtered by help-probe.
+    """
+    run_dir = f"{MNT_OUT}/vggt/runs/{cfg.seq_names}_{run_tag}"
     ckpt_dir = f"{MNT_OUT}/vggt/ckpt/{cfg.seq_names}_{run_tag}"
 
     args: List[str] = []
     # paths
-    args += ["--log_dir", log_dir]
+    args += ["--out_dir", run_dir]
     args += ["--ckpt_dir", ckpt_dir]
-    args += ["--zju_root", cfg.zju_root]
 
     # core
     args += ["--seq_names", cfg.seq_names]
@@ -370,11 +244,8 @@ def _build_train_args(cfg: TrainConfig, run_tag: str) -> List[str]:
     args += ["--batch_size", str(cfg.batch_size)]
     args += ["--accum_steps", str(cfg.accum_steps)]
     args += ["--lr", str(cfg.lr)]
-
-    # workers: pass both styles; help-filter keeps the one that exists
     args += ["--num_workers", str(cfg.num_workers)]
-    args += ["--num_workers_train", str(cfg.num_workers_train)]
-    args += ["--num_workers_val", str(cfg.num_workers_val)]
+    args += ["--seed", str(cfg.seed)]
 
     # schedule / convergence
     args += ["--lr_schedule", cfg.lr_schedule]
@@ -383,23 +254,25 @@ def _build_train_args(cfg: TrainConfig, run_tag: str) -> List[str]:
     if int(cfg.early_stop) > 0:
         args += ["--early_stop", str(int(cfg.early_stop))]
 
-    # best_by / ema
+    # eval/save cadence
+    args += ["--eval_every", str(cfg.eval_every)]
+    args += ["--save_every", str(cfg.save_every)]
     args += ["--best_by", cfg.best_by]
+
+    # ema
     if cfg.use_ema:
         args += ["--use_ema"]
         args += ["--ema_decay", str(cfg.ema_decay)]
-        # Some versions use ema_start_step; some use ema_start; filter will keep what's valid
         args += ["--ema_start_step", str(cfg.ema_start_step)]
-        args += ["--ema_start", str(cfg.ema_start_step)]
 
     # conf head / gate
     if cfg.split_conf_head:
         args += ["--split_conf_head"]
-    args += ["--conf_head_lr_mult", str(cfg.conf_head_lr_mult)]
+        args += ["--conf_head_lr_mult", str(cfg.conf_head_lr_mult)]
     args += ["--conf_gate_warmup", str(cfg.conf_gate_warmup)]
     args += ["--conf_sigmoid_temp", str(cfg.conf_sigmoid_temp)]
 
-    # masks / quantile
+    # mask/quantile
     args += ["--bg_weight", str(cfg.bg_weight)]
     args += ["--train_mask_mode", cfg.train_mask_mode]
     args += ["--recon_mask_mode", cfg.recon_mask_mode]
@@ -407,7 +280,6 @@ def _build_train_args(cfg: TrainConfig, run_tag: str) -> List[str]:
         args += ["--recon_weight_renorm"]
     if float(cfg.recon_weight_clip_max) > 0:
         args += ["--recon_weight_clip_max", str(cfg.recon_weight_clip_max)]
-
     if cfg.conf_use_quantile:
         args += ["--conf_use_quantile"]
         args += ["--conf_qlo", str(cfg.conf_qlo)]
@@ -422,8 +294,8 @@ def _build_train_args(cfg: TrainConfig, run_tag: str) -> List[str]:
         args += ["--tf32"]
 
     # holdout
-    if (cfg.holdout_view_ids or "").strip():
-        args += ["--holdout_view_ids", (cfg.holdout_view_ids or "").strip()]
+    if cfg.holdout_view_ids.strip():
+        args += ["--holdout_view_ids", cfg.holdout_view_ids.strip()]
 
     # debug
     args += ["--debug_train_every", str(cfg.debug_train_every)]
@@ -431,10 +303,6 @@ def _build_train_args(cfg: TrainConfig, run_tag: str) -> List[str]:
         args += ["--debug_val_every_epoch"]
     if cfg.split_cat_panels:
         args += ["--split_cat_panels"]
-
-    # extra args (verbatim)
-    if (cfg.extra_train_args or "").strip():
-        args += shlex.split(cfg.extra_train_args)
 
     return args
 
@@ -453,36 +321,31 @@ def _run_remote(cfg_json: str) -> None:
     cfg_dict = json.loads(cfg_json)
     cfg = TrainConfig(**cfg_dict)
 
+    # chdir to bundled code path; training script is expected to live here.
     os.chdir(MNT_CODE)
+
     py = sys.executable
     script = cfg.train_script
-
-    # --- resolve zju_root inside the remote container ---
-    seq_list = _split_seq_names(cfg.seq_names)
-
-    # If user passed a Windows path, it will fail checks; we will fall back to auto-detect.
-    zju_hint = cfg.zju_root
-    cfg.zju_root = _find_zju_root_remote(seq_list, zju_hint)
-
-    print("[modal] CODE:", MNT_CODE)
-    print("[modal] DATA:", MNT_DATA)
-    print("[modal] OUT :", MNT_OUT)
-    print("[modal] train_script:", script)
-    print("[modal] zju_root:", cfg.zju_root)
-    print("[modal] seq_list:", seq_list)
 
     run_tag = _make_run_tag()
     argv = _build_train_args(cfg, run_tag)
 
     # Filter argv by training script --help so version mismatch won't kill you.
     argv2 = _filter_args_by_help(py, script, argv)
+
     cmd = [py, "-u", script] + argv2
 
+    print("[modal] CODE:", MNT_CODE)
+    print("[modal] DATA:", MNT_DATA)
+    print("[modal] OUT :", MNT_OUT)
+    print("[modal] train_script:", script)
     print("[modal] run_tag:", run_tag)
     print("[modal] cmd:", shlex.join(cmd))
 
+    # Run
     subprocess.check_call(cmd)
 
+    # Persist outputs
     try:
         out_vol.commit()
         print("[modal] out volume committed.")
@@ -493,38 +356,36 @@ def _run_remote(cfg_json: str) -> None:
 @app.local_entrypoint()
 def main():
     """
-    No CLI required: set env vars before `modal run modal_run_train.py`.
-
-    Key envs:
-      VGGT_ZJU_ROOT      : remote path hint (e.g. /mnt/data/zju_mocap). Empty = auto-detect.
-      VGGT_SEQ           : CoreView_390 or "CoreView_390,CoreView_392"
-      VGGT_GPU           : a100-80g / h100 / l40s ...
-      TRAIN_ARGS         : extra flags appended to training script
-      VGGT_DATA_VOL      : data volume name (default vggt-zju-data)
-      VGGT_OUT_VOL       : out volume name  (default vggt-out)
+    No CLI required: edit defaults below (or set env vars).
+    If you still want overrides, you can set env like:
+      VGGT_SEQ, VGGT_EPOCHS, VGGT_LR, VGGT_LR_SCHEDULE, VGGT_WARMUP, VGGT_MIN_LR_RATIO,
+      VGGT_EARLY_STOP, VGGT_BEST_BY, VGGT_EMA_DECAY, VGGT_GPU, etc.
+    Code packaging:
+      Local repo is baked into the image via image.add_local_dir(..., /mnt/code).
+      VGGT_CODE_DIR can override the local repo path.
     """
+    # Force EMA defaults in the run env unless explicitly overridden
+    os.environ.setdefault("VGGT_EMA_DECAY", "0.99")
+    os.environ.setdefault("VGGT_EMA_START", "0")
+
     cfg = TrainConfig()
 
-    # data hint (remote)
-    cfg.zju_root = os.environ.get("VGGT_ZJU_ROOT", cfg.zju_root)
-
-    # core
+    # ----- ENV overrides (optional; keep this so you can change behavior without touching code) -----
     cfg.seq_names = os.environ.get("VGGT_SEQ", cfg.seq_names)
     cfg.epochs = int(os.environ.get("VGGT_EPOCHS", str(cfg.epochs)))
     cfg.batch_size = int(os.environ.get("VGGT_BS", str(cfg.batch_size)))
     cfg.accum_steps = int(os.environ.get("VGGT_ACCUM", str(cfg.accum_steps)))
     cfg.lr = float(os.environ.get("VGGT_LR", str(cfg.lr)))
 
-    # schedule
     cfg.lr_schedule = os.environ.get("VGGT_LR_SCHEDULE", cfg.lr_schedule)
     cfg.warmup_steps = int(os.environ.get(
         "VGGT_WARMUP", str(cfg.warmup_steps)))
     cfg.min_lr_ratio = float(os.environ.get(
         "VGGT_MIN_LR_RATIO", str(cfg.min_lr_ratio)))
+
     cfg.early_stop = int(os.environ.get(
         "VGGT_EARLY_STOP", str(cfg.early_stop)))
 
-    # best / ema
     cfg.best_by = os.environ.get("VGGT_BEST_BY", cfg.best_by)
     cfg.use_ema = _truthy(os.environ.get(
         "VGGT_USE_EMA", "1" if cfg.use_ema else "0"))
@@ -532,7 +393,6 @@ def main():
     cfg.ema_start_step = int(os.environ.get(
         "VGGT_EMA_START", str(cfg.ema_start_step)))
 
-    # conf / gate
     cfg.split_conf_head = _truthy(os.environ.get(
         "VGGT_SPLIT_CONF_HEAD", "1" if cfg.split_conf_head else "0"))
     cfg.conf_head_lr_mult = float(os.environ.get(
@@ -542,7 +402,6 @@ def main():
     cfg.conf_sigmoid_temp = float(os.environ.get(
         "VGGT_CONF_SIGMOID_TEMP", str(cfg.conf_sigmoid_temp)))
 
-    # masks / quantile
     cfg.bg_weight = float(os.environ.get("VGGT_BG_WEIGHT", str(cfg.bg_weight)))
     cfg.train_mask_mode = os.environ.get(
         "VGGT_TRAIN_MASK_MODE", cfg.train_mask_mode)
@@ -557,21 +416,12 @@ def main():
     cfg.conf_qlo = float(os.environ.get("VGGT_CONF_QLO", str(cfg.conf_qlo)))
     cfg.conf_qhi = float(os.environ.get("VGGT_CONF_QHI", str(cfg.conf_qhi)))
 
-    # precision
     cfg.amp = _truthy(os.environ.get("VGGT_AMP", "1" if cfg.amp else "0"))
     cfg.tf32 = _truthy(os.environ.get("VGGT_TF32", "1" if cfg.tf32 else "0"))
 
-    # workers
-    cfg.num_workers = int(os.environ.get(
-        "VGGT_NUM_WORKERS", str(cfg.num_workers)))
-    cfg.num_workers_train = int(os.environ.get(
-        "VGGT_NUM_WORKERS_TRAIN", str(cfg.num_workers_train)))
-    cfg.num_workers_val = int(os.environ.get(
-        "VGGT_NUM_WORKERS_VAL", str(cfg.num_workers_val)))
-
-    # holdout/debug
     cfg.holdout_view_ids = os.environ.get(
         "VGGT_HOLDOUT_VIDS", cfg.holdout_view_ids)
+
     cfg.debug_train_every = int(os.environ.get(
         "VGGT_DEBUG_TRAIN_EVERY", str(cfg.debug_train_every)))
     cfg.debug_val_every_epoch = _truthy(os.environ.get(
@@ -579,13 +429,13 @@ def main():
     cfg.split_cat_panels = _truthy(os.environ.get(
         "VGGT_SPLIT_CAT_PANELS", "1" if cfg.split_cat_panels else "0"))
 
-    # script / extra args
     cfg.train_script = os.environ.get("VGGT_TRAIN_SCRIPT", cfg.train_script)
-    cfg.extra_train_args = os.environ.get("TRAIN_ARGS", cfg.extra_train_args)
-
-    # runner
     cfg.gpu = os.environ.get("VGGT_GPU", cfg.gpu)
     cfg.timeout_sec = int(os.environ.get("VGGT_TIMEOUT", str(cfg.timeout_sec)))
+    # ---------------------------------------------------------------------------------------------
+
+    # Ensure Modal function uses the desired GPU if set via env
+    # (Modal binds GPU at decoration time, so we recommend setting VGGT_GPU before `modal run`.)
     if cfg.timeout_sec > 86400:
         cfg.timeout_sec = 86400
 

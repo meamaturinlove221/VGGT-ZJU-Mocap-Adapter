@@ -12,7 +12,7 @@ from datetime import datetime
 from typing import Dict, Any, Tuple, Optional, List
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 import torch
 import torch.nn as nn
@@ -187,6 +187,44 @@ def _parse_only_steps_env(env_key: str = "ONLY_STEPS") -> set:
         except Exception:
             continue
     return out
+
+
+def _parse_int_list(raw: str) -> List[int]:
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple)):
+        out = []
+        for v in raw:
+            try:
+                out.append(int(v))
+            except Exception:
+                continue
+        return out
+    s = str(raw).strip()
+    if not s:
+        return []
+    parts = re.split(r"[,\s;/]+", s)
+    out = []
+    for p in parts:
+        if not p:
+            continue
+        try:
+            out.append(int(p))
+        except Exception:
+            continue
+    return out
+
+
+def _parse_str_list(raw: str) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple)):
+        return [str(v).strip() for v in raw if str(v).strip()]
+    s = str(raw).strip()
+    if not s:
+        return []
+    parts = re.split(r"[,\s;/]+", s)
+    return [p for p in parts if p]
 
 
 def _as_torch(x):
@@ -789,6 +827,72 @@ def pick_first_tensor(batch: Dict[str, Any], keys: List[str]):
     return None, None
 
 
+def _assert_tensor_ok(t: Any, *, name: str, where: str, ndims: Tuple[int, ...]):
+    if not torch.is_tensor(t):
+        raise TypeError(f"[batch-assert] {where}: {name} is not a tensor")
+    if t.ndim not in ndims:
+        raise ValueError(
+            f"[batch-assert] {where}: {name} ndim={t.ndim} not in {ndims}")
+    if t.numel() == 0 or any(int(d) <= 0 for d in t.shape):
+        raise ValueError(
+            f"[batch-assert] {where}: {name} has empty shape {tuple(t.shape)}")
+    if t.shape[-1] <= 0 or t.shape[-2] <= 0:
+        raise ValueError(
+            f"[batch-assert] {where}: {name} has invalid H/W {tuple(t.shape[-2:])}")
+
+
+def _require_any_tensor(batch: Dict[str, Any], keys: List[str], where: str):
+    key, t = pick_first_tensor(batch, keys)
+    if t is None:
+        raise KeyError(
+            f"[batch-assert] {where}: missing required key (any of {keys})")
+    return key, t
+
+
+def assert_batch_shapes(batch: Dict[str, Any], where: str):
+    if not isinstance(batch, dict):
+        raise TypeError(f"[batch-assert] {where}: batch is not a dict")
+
+    # src
+    _assert_tensor_ok(batch.get("src_imgs", None),
+                      name="src_imgs", where=where, ndims=(5,))
+    _assert_tensor_ok(batch.get("src_depth", None),
+                      name="src_depth", where=where, ndims=(5,))
+    _assert_tensor_ok(batch.get("src_depth_conf", None),
+                      name="src_depth_conf", where=where, ndims=(5,))
+    _assert_tensor_ok(batch.get("src_pointmap", None),
+                      name="src_pointmap", where=where, ndims=(5,))
+
+    # tgt core
+    _assert_tensor_ok(batch.get("tgt_img", None),
+                      name="tgt_img", where=where, ndims=(4,))
+
+    _, tgt_depth = _require_any_tensor(
+        batch, ["tgt_depth", "depth_tgt", "tgt_depth_map", "depth"], where)
+    _assert_tensor_ok(tgt_depth, name="tgt_depth", where=where, ndims=(3, 4))
+
+    _, tgt_depth_conf = _require_any_tensor(
+        batch, ["tgt_depth_conf", "depth_conf_tgt",
+                "tgt_conf_depth", "tgt_depthconf", "tgt_conf", "tgt_mask_conf", "conf_tgt"],
+        where
+    )
+    _assert_tensor_ok(
+        tgt_depth_conf, name="tgt_depth_conf", where=where, ndims=(3, 4))
+
+    _, tgt_fg = _require_any_tensor(
+        batch, ["tgt_fg", "fg_mask", "tgt_fg_mask", "tgt_mask", "tgt_silhouette", "silhouette",
+                "human_mask", "person_mask", "tgt_alpha", "alpha", "seg", "tgt_seg"],
+        where
+    )
+    _assert_tensor_ok(tgt_fg, name="tgt_fg", where=where, ndims=(3, 4))
+
+    if args is not None and bool(getattr(args, "fg_drop_ground", False)):
+        _, tgt_pointmap = _require_any_tensor(
+            batch, ["tgt_pointmap", "tgt_point_map", "pointmap_tgt", "tgt_points"], where)
+        _assert_tensor_ok(
+            tgt_pointmap, name="tgt_pointmap", where=where, ndims=(4,))
+
+
 # ---------------------------
 # Masks builder (key-robust)
 # ---------------------------
@@ -1235,8 +1339,59 @@ def tv_l1(x: torch.Tensor) -> torch.Tensor:
 # ---------------------------
 # Debug pack saver (updated: split cat panels)
 # ---------------------------
+def _write_debug_error(out_dir: str, prefix: str, step: int, msg: str):
+    os.makedirs(out_dir, exist_ok=True)
+    text = str(msg).strip()
+    if not text:
+        text = "unknown error"
+    # create a simple white panel with error text
+    w, h = 960, 540
+    img = Image.new("RGB", (w, h), color=(255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    lines = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            lines.append("")
+            continue
+        while len(line) > 80:
+            lines.append(line[:80])
+            line = line[80:]
+        lines.append(line)
+    if not lines:
+        lines = [text]
+    y = 10
+    for line in lines:
+        draw.text((10, y), line, fill=(0, 0, 0))
+        y += 18
+    path = os.path.join(out_dir, f"{prefix}_ERROR_step{step:06d}.png")
+    img.save(path)
+    try:
+        with open(path.replace(".png", ".txt"), "w", encoding="utf-8") as f:
+            f.write(text)
+    except Exception:
+        pass
+
+
 def save_debug_pack(pred, tgt, aux, step, out_dir="debug_viewdec_ablation", prefix="train", split_cat_panels: bool = True):
     os.makedirs(out_dir, exist_ok=True)
+
+    def _fail(msg: str):
+        _write_debug_error(out_dir, prefix, int(step), msg)
+        raise RuntimeError(msg)
+
+    # hard checks to avoid silent "whiteboard" debug panels
+    if not torch.is_tensor(pred) or pred.ndim != 4:
+        _fail(f"[debug] pred invalid: type={type(pred)} ndim={getattr(pred, 'ndim', None)}")
+    if not torch.is_tensor(tgt) or tgt.ndim != 4:
+        _fail(f"[debug] tgt invalid: type={type(tgt)} ndim={getattr(tgt, 'ndim', None)}")
+    if pred.numel() == 0 or tgt.numel() == 0:
+        _fail(f"[debug] pred/tgt empty: pred_shape={tuple(pred.shape)} tgt_shape={tuple(tgt.shape)}")
+    if pred.shape[0] != tgt.shape[0]:
+        _fail(f"[debug] batch mismatch: pred_shape={tuple(pred.shape)} tgt_shape={tuple(tgt.shape)}")
+    if pred.shape[-2:] != tgt.shape[-2:]:
+        _fail(f"[debug] HW mismatch: pred_shape={tuple(pred.shape)} tgt_shape={tuple(tgt.shape)}")
+
     pred_raw = pred
     pred_vis = pred
     vis_weight = None
@@ -1287,9 +1442,11 @@ def save_debug_pack(pred, tgt, aux, step, out_dir="debug_viewdec_ablation", pref
         return F.interpolate(x, size=(H, W), mode="bilinear", align_corners=False)
 
     def _save1(name, x1):
+        if not torch.is_tensor(x1) or x1.ndim != 4 or x1.numel() == 0:
+            _fail(f"[debug] aux[{name}] invalid: type={type(x1)} shape={getattr(x1, 'shape', None)}")
         x1 = _resize_to_hw(x1, is_mask=True)
         if x1 is None:
-            return
+            _fail(f"[debug] aux[{name}] resize failed: shape={getattr(x1, 'shape', None)}")
         img = to_u8_img(x1[0], name=name)
         path_single = os.path.join(
             out_dir, f"{prefix}_{name}_step{step:06d}.png")
@@ -1411,12 +1568,21 @@ def parse_args():
     p.add_argument("--lr", type=float, default=5e-5)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--conf_head_lr_mult", type=float, default=2.0,
-                   help="LR multiplier for core.out_conv (RGB+conf head). Set 1.0 to disable.")
+                   help="LR multiplier for conf head (core.out_conf if split_conf_head else core.out_conv). Set 1.0 to disable.")
+    p.add_argument("--print_param_groups", action="store_true", default=False,
+                   help="Print optimizer param group names for debugging.")
 
     p.add_argument("--train_ratio", type=float, default=0.9)
     p.add_argument("--split_seed", type=int, default=0)
+    p.add_argument("--split_mode", type=str, default="random",
+                   choices=["random", "contiguous"],
+                   help="Split frames by random shuffle or contiguous tail for val.")
     p.add_argument("--frame_subsample", type=int, default=1)
     p.add_argument("--num_src_views", type=int, default=3)
+    p.add_argument("--holdout_view_ids", type=str, default="",
+                   help="Comma-separated camera IDs to hold out (val-only targets).")
+    p.add_argument("--holdout_view_names", type=str, default="",
+                   help="Comma-separated camera names to hold out (overrides ids if provided).")
 
     p.add_argument("--resume", type=str, default="", help="ckpt path")
     p.add_argument("--log_dir", type=str, default="debug_viewdec_ablation")
@@ -1442,7 +1608,16 @@ def parse_args():
     p.add_argument("--use_ema", action="store_true", default=True)
     p.add_argument("--no_use_ema", dest="use_ema",
                    action="store_false", help="Disable EMA")
-    p.add_argument("--ema_decay", type=float, default=0.999)
+    p.add_argument("--ema_decay", type=float, default=0.995)
+    p.add_argument("--ema_start_step", type=int, default=0,
+                   help="Start EMA updates after this optimizer step (0 = start immediately).")
+    p.add_argument("--ema_start_after_warmup", action="store_true", default=False,
+                   help="Start EMA after warmup_steps (overrides ema_start_step if larger).")
+    p.add_argument("--ema_start_hardcopy", dest="ema_start_hardcopy",
+                   action="store_true", help="Hard-copy model -> EMA when EMA starts.")
+    p.add_argument("--no_ema_start_hardcopy", dest="ema_start_hardcopy",
+                   action="store_false", help="Disable hard-copy at EMA start.")
+    p.set_defaults(ema_start_hardcopy=True)
     p.add_argument("--best_by", type=str, default="raw_psnr",
                    choices=["raw_psnr", "raw_ssim", "raw", "raw_l1", "ema", "ema_psnr", "ema_ssim"])
 
@@ -1665,6 +1840,9 @@ def main():
     args = parse_args()
     args.use_view_cond = bool(args.use_view_cond)
     args.finetune_view_only = bool(args.finetune_view_only)
+    if args.ema_start_after_warmup:
+        args.ema_start_step = max(int(args.ema_start_step), int(args.warmup_steps))
+    args.ema_start_step = max(0, int(args.ema_start_step))
     setup_torch_stability(tf32=args.tf32, cudnn_benchmark=args.cudnn_benchmark)
     seed_everything(args.seed)
 
@@ -1682,6 +1860,11 @@ def main():
     only_steps = _parse_only_steps_env()
     if only_steps:
         print(f"[info] ONLY_STEPS (train debug pack) = {sorted(only_steps)}")
+
+    holdout_view_ids = _parse_int_list(args.holdout_view_ids)
+    holdout_view_names = _parse_str_list(args.holdout_view_names)
+    if holdout_view_names:
+        holdout_view_ids = []
 
     ini_logger = IniLogger(os.path.join(args.log_dir, "run_log.ini"))
     ini_logger.log("meta", {
@@ -1701,6 +1884,9 @@ def main():
         "conf_sup_gamma": args.conf_sup_gamma,
         "train_mask_mode": args.train_mask_mode,
         "recon_mask_mode": args.recon_mask_mode,
+        "split_mode": args.split_mode,
+        "holdout_view_ids": ",".join(str(v) for v in holdout_view_ids),
+        "holdout_view_names": ",".join(holdout_view_names),
         "fg_drop_ground": args.fg_drop_ground,
         "fg_ground_axis": args.fg_ground_axis,
         "fg_ground_q": args.fg_ground_q,
@@ -1711,6 +1897,9 @@ def main():
         "cudnn_benchmark": args.cudnn_benchmark,
         "use_ema": args.use_ema,
         "ema_decay": args.ema_decay,
+        "ema_start_step": args.ema_start_step,
+        "ema_start_after_warmup": args.ema_start_after_warmup,
+        "ema_start_hardcopy": args.ema_start_hardcopy,
         "best_by": args.best_by,
         "use_view_cond": args.use_view_cond,
         "view_cond_mode": args.view_cond_mode,
@@ -1740,6 +1929,9 @@ def main():
         split="train",
         train_ratio=args.train_ratio,
         split_seed=args.split_seed,
+        split_mode=args.split_mode,
+        tgt_view_ids_exclude=(holdout_view_ids if holdout_view_ids else None),
+        tgt_view_names_exclude=(holdout_view_names if holdout_view_names else None),
         deterministic_views=False,
     )
     val_dataset = ZJUViewSynthDataset(
@@ -1750,6 +1942,9 @@ def main():
         split="val",
         train_ratio=args.train_ratio,
         split_seed=args.split_seed,
+        split_mode=args.split_mode,
+        tgt_view_ids=(holdout_view_ids if holdout_view_ids else None),
+        tgt_view_names=(holdout_view_names if holdout_view_names else None),
         deterministic_views=True,
     )
     if args.use_view_cond and args.num_views <= 0:
@@ -1792,8 +1987,10 @@ def main():
             print(f"[debug] batch keys = {list(b0.keys())}")
             ini_logger.log(
                 "batch_keys", {"keys": ",".join([str(k) for k in b0.keys()])})
-    except Exception:
-        pass
+            assert_batch_shapes(b0, where="train/boot")
+    except Exception as e:
+        print(f"[fatal] batch sanity check failed: {e}")
+        raise
 
     # ---------------------------
     # Model
@@ -1867,7 +2064,9 @@ def main():
     conf_head_lr_mult = float(getattr(args, "conf_head_lr_mult", 1.0))
     if conf_head_lr_mult != 1.0:
         head_params = []
+        head_names = []
         base_params = []
+        base_names = []
         head_key = "core.out_conf" if bool(
             getattr(model.core, "split_conf_head", False)) else "core.out_conv"
         for name, p in model.named_parameters():
@@ -1875,8 +2074,10 @@ def main():
                 continue
             if head_key in name:
                 head_params.append(p)
+                head_names.append(name)
             else:
                 base_params.append(p)
+                base_names.append(name)
         if head_params and base_params:
             optimizer = torch.optim.AdamW(
                 [
@@ -1890,9 +2091,38 @@ def main():
                 f"[info] conf_head_lr_mult={conf_head_lr_mult:.3f} "
                 f"head_key={head_key} base={len(base_params)} head={len(head_params)}"
             )
+            if (not bool(getattr(model.core, "split_conf_head", False))):
+                print(
+                    "[warn] split_conf_head=0: conf_head_lr_mult applies to core.out_conv (RGB+conf). "
+                    "Use --split_conf_head to target conf-only head."
+                )
+            if bool(getattr(model.core, "split_conf_head", False)) and not head_params:
+                print(
+                    "[warn] split_conf_head=1 but no params matched core.out_conf; "
+                    "check module naming or split_conf_head wiring."
+                )
+            if args.print_param_groups:
+                def _preview(names, limit=30):
+                    if len(names) <= limit:
+                        return names
+                    return names[:limit] + [f"... (+{len(names)-limit} more)"]
+                overlap = set(head_names) & set(base_names)
+                if overlap:
+                    print(f"[warn] param group overlap detected: {sorted(list(overlap))[:5]}")
+                print("[debug] head params:")
+                for n in _preview(head_names):
+                    print(f"  {n}")
+                print("[debug] base params:")
+                for n in _preview(base_names):
+                    print(f"  {n}")
         else:
             optimizer = torch.optim.AdamW(
                 train_params, lr=args.lr, weight_decay=args.weight_decay)
+            if bool(getattr(model.core, "split_conf_head", False)) and not head_params:
+                print(
+                    "[warn] split_conf_head=1 but no params matched core.out_conf; "
+                    "falling back to single param group."
+                )
     else:
         optimizer = torch.optim.AdamW(
             train_params, lr=args.lr, weight_decay=args.weight_decay)
@@ -1979,6 +2209,16 @@ def main():
             print(
                 f"[info] resume meta: epoch={start_epoch} global_step={global_step} best_val={best_val:.6f} no_improve={epochs_no_improve}")
 
+    ema_start_step = int(args.ema_start_step)
+    if args.use_ema and ema_model is not None and ema_start_step > 0:
+        ema_started = (global_step >= ema_start_step)
+        print(
+            f"[info] EMA start_step={ema_start_step} hardcopy={bool(args.ema_start_hardcopy)} "
+            f"(started={ema_started})"
+        )
+    else:
+        ema_started = True
+
     def run_val(
         eval_model: nn.Module,
         *,
@@ -2006,6 +2246,7 @@ def main():
 
         with torch.no_grad():
             for it, batch in enumerate(val_loader):
+                assert_batch_shapes(batch, where=f"val/e{epoch:03d}/it{it:04d}")
                 src_imgs = batch["src_imgs"].to(device, non_blocking=True)
                 src_depth = batch["src_depth"].to(device, non_blocking=True)
                 src_depth_conf = batch["src_depth_conf"].to(
@@ -2183,6 +2424,7 @@ def main():
         optimizer.zero_grad(set_to_none=True)
 
         for inner, batch in enumerate(train_loader):
+            assert_batch_shapes(batch, where=f"train/e{epoch:03d}/it{inner:04d}")
             src_imgs = batch["src_imgs"].to(device, non_blocking=True)
             src_depth = batch["src_depth"].to(device, non_blocking=True)
             src_depth_conf = batch["src_depth_conf"].to(
@@ -2374,7 +2616,14 @@ def main():
                     global_step += 1
 
                     if args.use_ema and ema_model is not None:
-                        ema_update(ema_model, model, decay=args.ema_decay)
+                        if (not ema_started) and (global_step >= ema_start_step):
+                            ema_started = True
+                            if args.ema_start_hardcopy:
+                                ema_model.load_state_dict(
+                                    model.state_dict(), strict=False)
+                                print("[info] EMA start: hard-copied model weights.")
+                        if ema_started:
+                            ema_update(ema_model, model, decay=args.ema_decay)
 
                 except RuntimeError as e:
                     print(f"[warn] optimizer step error (skip): {e}")
@@ -2544,7 +2793,7 @@ def main():
             model, save_debug=True, tag="raw", collect_by_view=True,
             conf_gate_strength_override=val_gate_strength)
         ema_val, ema_psnr, ema_ssim = None, None, None
-        if args.use_ema and ema_model is not None:
+        if args.use_ema and ema_model is not None and ema_started:
             ema_val, ema_psnr, ema_ssim, _ = run_val(
                 ema_model, save_debug=False, tag="ema", collect_by_view=False,
                 conf_gate_strength_override=val_gate_strength)

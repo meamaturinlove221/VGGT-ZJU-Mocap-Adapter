@@ -1,6 +1,7 @@
 # zju_dataset_view.py
 import os
 import os.path as osp
+import re
 import numpy as np
 from PIL import Image
 
@@ -19,8 +20,13 @@ class ZJUViewSynthDataset(Dataset):
         split=None,                # None / "train" / "val" / "test"
         train_ratio=0.9,
         split_seed=0,
+        split_mode="random",
         deterministic_views=False,  # True 时每个样本固定 src/tgt 选法（val/test 建议 True）
         view_seed=2025,
+        tgt_view_ids=None,
+        tgt_view_names=None,
+        tgt_view_ids_exclude=None,
+        tgt_view_names_exclude=None,
     ):
         """
         读取 precompute_zju_vggt_geom.py 生成的 npz（vggt_geom/*.npz）
@@ -37,6 +43,7 @@ class ZJUViewSynthDataset(Dataset):
         self.split = split
         self.train_ratio = float(train_ratio)
         self.split_seed = int(split_seed)
+        self.split_mode = str(split_mode) if split_mode else "random"
 
         self.deterministic_views = bool(deterministic_views)
         self.view_seed = int(view_seed)
@@ -44,6 +51,12 @@ class ZJUViewSynthDataset(Dataset):
         self.num_views_by_seq = {}
         self.cam_name_to_id = {}
         self.cam_names = []
+        self.tgt_view_ids = None
+        self.tgt_view_ids_exclude = None
+        self._tgt_view_ids_raw = tgt_view_ids
+        self._tgt_view_names_raw = tgt_view_names
+        self._tgt_view_ids_exclude_raw = tgt_view_ids_exclude
+        self._tgt_view_names_exclude_raw = tgt_view_names_exclude
 
         # --- 收集所有帧（all samples） ---
         all_samples = []
@@ -88,13 +101,28 @@ class ZJUViewSynthDataset(Dataset):
                 )
                 global_idx += 1
 
+        self.tgt_view_ids = self._resolve_view_ids(
+            self._tgt_view_ids_raw, self._tgt_view_names_raw
+        )
+        self.tgt_view_ids_exclude = self._resolve_view_ids(
+            self._tgt_view_ids_exclude_raw, self._tgt_view_names_exclude_raw
+        )
+
+
         # --- split 划分 ---
         if split is None:
             self.samples = all_samples
         else:
-            rng = np.random.RandomState(self.split_seed)
             idx_all = np.arange(len(all_samples))
-            rng.shuffle(idx_all)
+            if self.split_mode == "random":
+                rng = np.random.RandomState(self.split_seed)
+                rng.shuffle(idx_all)
+            elif self.split_mode == "contiguous":
+                pass
+            else:
+                raise ValueError(
+                    f"Unknown split_mode={self.split_mode}, expected one of ['random','contiguous']"
+                )
 
             num_train = int(len(idx_all) * self.train_ratio)
             if split == "train":
@@ -122,6 +150,44 @@ class ZJUViewSynthDataset(Dataset):
 
     def __len__(self):
         return len(self.samples)
+
+    def _resolve_view_ids(self, raw_ids, raw_names):
+        ids = set()
+
+        def _add_id(v):
+            try:
+                ids.add(int(v))
+            except Exception:
+                return
+
+        if raw_ids is not None:
+            if isinstance(raw_ids, (list, tuple, np.ndarray)):
+                for v in raw_ids:
+                    _add_id(v)
+            else:
+                s = str(raw_ids).strip()
+                if s:
+                    for p in re.split(r"[,\s;/]+", s):
+                        if p:
+                            _add_id(p)
+
+        names = []
+        if raw_names is not None:
+            if isinstance(raw_names, (list, tuple, np.ndarray)):
+                names = [str(v).strip() for v in raw_names if str(v).strip()]
+            else:
+                s = str(raw_names).strip()
+                if s:
+                    names = [p for p in re.split(r"[,\s;/]+", s) if p]
+        for name in names:
+            if name not in self.cam_name_to_id:
+                raise KeyError(
+                    f"[ZJUViewSynthDataset] unknown cam name: {name}")
+            ids.add(int(self.cam_name_to_id[name]))
+
+        if len(ids) == 0:
+            return None
+        return sorted(ids)
 
     def _decode_cam_name(self, name):
         if isinstance(name, bytes):
@@ -297,17 +363,40 @@ class ZJUViewSynthDataset(Dataset):
             cam_ids = np.arange(V)
         num_src = min(self.num_src_views, V - 1)
 
-        # --- 选 src/tgt：train 可随机，val/test 建议固定 ---
+        # --- select src/tgt (train random, val/test deterministic) ---
         if self.deterministic_views:
-            # 用 global_idx 固定（不受 split 子集 index 变化影响）
             seed = self.view_seed + int(meta.get("global_idx", index))
             rng = np.random.RandomState(seed)
-            perm = rng.permutation(cam_ids)
         else:
-            perm = np.random.permutation(cam_ids)
+            rng = np.random
 
-        src_idxs = perm[:num_src]
-        tgt_idx = perm[num_src]
+        if (self.tgt_view_ids is None) and (self.tgt_view_ids_exclude is None):
+            perm = rng.permutation(cam_ids)
+            src_idxs = perm[:num_src]
+            tgt_idx = perm[num_src]
+        else:
+            eligible = []
+            for i in range(V):
+                vid = int(cam_ids[i])
+                if self.tgt_view_ids is not None and vid not in self.tgt_view_ids:
+                    continue
+                if self.tgt_view_ids_exclude is not None and vid in self.tgt_view_ids_exclude:
+                    continue
+                eligible.append(i)
+            if not eligible:
+                raise RuntimeError(
+                    f"[ZJUViewSynthDataset] no eligible tgt views after holdout filter in {geom_path}"
+                )
+            if len(eligible) == 1:
+                tgt_idx = eligible[0]
+            else:
+                tgt_idx = int(rng.choice(eligible))
+            remaining = [i for i in range(V) if i != tgt_idx]
+            if len(remaining) < num_src:
+                num_src = len(remaining)
+            perm = rng.permutation(remaining)
+            src_idxs = perm[:num_src]
+
         src_vids = cam_ids[src_idxs]
         tgt_vid = cam_ids[tgt_idx]
 
