@@ -1,6 +1,7 @@
 import os
 import math
 import time
+import json
 import argparse
 import numpy as np
 from PIL import Image
@@ -9,7 +10,7 @@ import torch
 from zju_dataset_view import ZJUViewSynthDataset
 from view_decoder_ablation import GeomViewDecoderAblation
 from train_view_decoder_ablation import (
-    autocast_ctx, build_masks_from_batch, masked_l1, save_debug_pack
+    autocast_ctx, build_masks_from_batch, masked_l1, save_debug_pack, build_vis_ranges
 )
 
 
@@ -19,6 +20,7 @@ def main():
     ap.add_argument('--seq_names', type=str, nargs='+', required=True)
     ap.add_argument('--index', type=int, default=0,
                     help='sample index inside the split subset')
+    ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--split', type=str, default='train',
                     choices=['train', 'val', 'test', 'None'])
     ap.add_argument('--num_src_views', type=int, default=3)
@@ -68,13 +70,14 @@ def main():
                     choices=['first', 'mean'])
     ap.add_argument('--use_conf_gate', type=int, default=1, choices=[0, 1])
     ap.add_argument('--conf_gate_detach', type=int, default=1, choices=[0, 1])
+    ap.add_argument('--conf_weight_detach', type=int, default=1, choices=[0, 1])
     ap.add_argument('--conf_gate_floor', type=float, default=0.0)
     ap.add_argument('--conf_gate_gamma', type=float, default=2.0)
     ap.add_argument('--recon_gate_floor', type=float, default=0.1)
     ap.add_argument('--conf_gate_warmup', type=int, default=1000)
     ap.add_argument('--conf_gate_ramp', type=int, default=0)
-    ap.add_argument('--conf_gate_ramp_mode', type=str, default='linear',
-                    choices=['linear', 'cosine', 'exp'])
+    ap.add_argument('--conf_gate_ramp_mode', type=str, default='smoothstep',
+                    choices=['linear', 'cosine', 'exp', 'smoothstep'])
     ap.add_argument('--conf_gate_ramp_k', type=float, default=5.0)
     ap.add_argument('--conf_bias_init', type=float, default=-1.0,
                     help='Init conf bias; -1 disables, (0,1) treated as prob, other values as logits (temp-aware)')
@@ -86,8 +89,27 @@ def main():
     ap.add_argument('--logit_clip', type=float, default=10.0)
     ap.add_argument('--print_logits', type=int, default=0, choices=[0, 1])
     ap.add_argument('--conf_head_lr_mult', type=float, default=2.0)
+    ap.add_argument('--use_depth_head', type=int, default=0, choices=[0, 1])
+    ap.add_argument('--vis_conf_min', type=float, default=0.0)
+    ap.add_argument('--vis_conf_max', type=float, default=1.0)
+    ap.add_argument('--vis_depth_min', type=float, default=0.0)
+    ap.add_argument('--vis_depth_max', type=float, default=5.0)
+    ap.add_argument('--vis_mask_min', type=float, default=0.0)
+    ap.add_argument('--vis_mask_max', type=float, default=1.0)
+    ap.add_argument('--vis_weight_min', type=float, default=0.0)
+    ap.add_argument('--vis_weight_max', type=float, default=1.0)
 
     args = ap.parse_args()
+    vis_ranges = build_vis_ranges(args)
+
+    def _seed_all(seed: int):
+        seed = int(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+    _seed_all(args.seed)
 
     def _resolve_conf_bias_init(raw: float):
         try:
@@ -103,6 +125,11 @@ def main():
     if str(args.run_name).strip():
         out_dir = os.path.join(out_dir, str(args.run_name).strip())
     os.makedirs(out_dir, exist_ok=True)
+    metrics_path = os.path.join(out_dir, "metrics.jsonl")
+    config_path = os.path.join(out_dir, "config.json")
+    if not os.path.isfile(config_path):
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(vars(args), f, indent=2, ensure_ascii=False)
 
     split = None if args.split == 'None' else args.split
     deterministic_views = True  # overfit 必须固定 src/tgt，不然你在追移动靶
@@ -166,6 +193,7 @@ def main():
         conf_gate_floor=float(args.conf_gate_floor),
         conf_bias_init=conf_bias_used,
         logit_clip=float(args.logit_clip),
+        use_depth_head=bool(args.use_depth_head),
     ).to(device)
 
     conf_bias_param = None
@@ -246,6 +274,7 @@ def main():
         f'train_mask_mode={str(args.train_mask_mode)} '
         f'recon_mask_mode={str(args.recon_mask_mode)} '
         f'conf_gate_detach={int(bool(args.conf_gate_detach))} '
+        f'conf_weight_detach={int(bool(args.conf_weight_detach))} '
         f'conf_gate_floor={float(args.conf_gate_floor):.3f} '
         f'conf_gate_gamma={float(args.conf_gate_gamma):.3f} '
         f'recon_gate_floor={float(args.recon_gate_floor):.3f} '
@@ -304,6 +333,37 @@ def main():
             return float((x < thr).float().mean().item() * 100.0)
         return float((x > thr).float().mean().item() * 100.0)
 
+    def _psnr(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> float:
+        mse = torch.mean((x - y) ** 2).clamp_min(eps)
+        return float((10.0 * torch.log10(1.0 / mse)).item())
+
+    def _ssim(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-6) -> float:
+        # simple SSIM on luminance
+        x = x.clamp(0, 1)
+        y = y.clamp(0, 1)
+        xg = 0.2989 * x[:, 0:1] + 0.5870 * x[:, 1:2] + 0.1140 * x[:, 2:3]
+        yg = 0.2989 * y[:, 0:1] + 0.5870 * y[:, 1:2] + 0.1140 * y[:, 2:3]
+        # gaussian blur (11x11)
+        def _gauss_kernel(device):
+            ksize = 11
+            sigma = 1.5
+            coords = torch.arange(ksize, device=device) - ksize // 2
+            g = torch.exp(-(coords ** 2) / (2 * sigma * sigma))
+            g = g / g.sum()
+            k = (g[:, None] * g[None, :]).view(1, 1, ksize, ksize)
+            return k
+        k = _gauss_kernel(x.device)
+        mu_x = torch.nn.functional.conv2d(xg, k, padding=5)
+        mu_y = torch.nn.functional.conv2d(yg, k, padding=5)
+        sigma_x = torch.nn.functional.conv2d(xg * xg, k, padding=5) - mu_x * mu_x
+        sigma_y = torch.nn.functional.conv2d(yg * yg, k, padding=5) - mu_y * mu_y
+        sigma_xy = torch.nn.functional.conv2d(xg * yg, k, padding=5) - mu_x * mu_y
+        C1, C2 = 0.01 ** 2, 0.03 ** 2
+        ssim_map = (2 * mu_x * mu_y + C1) * (2 * sigma_xy + C2) / (
+            (mu_x * mu_x + mu_y * mu_y + C1) * (sigma_x + sigma_y + C2) + eps
+        )
+        return float(ssim_map.mean().item())
+
     def _diff_png(path_a: str, path_b: str, out_path: str):
         if (not os.path.isfile(path_a)) or (not os.path.isfile(path_b)):
             return False
@@ -327,6 +387,8 @@ def main():
         t = max(0, int(step) - warm)
         progress = min(1.0, float(t) / float(ramp))
         mode = str(getattr(args, "conf_gate_ramp_mode", "linear")).lower()
+        if mode == "smoothstep":
+            return progress * progress * (3.0 - 2.0 * progress)
         if mode == "cosine":
             return 0.5 - 0.5 * math.cos(math.pi * progress)
         if mode == "exp":
@@ -378,6 +440,7 @@ def main():
                 pred_conf_gate=pred_conf,
                 use_conf_gate=bool(args.use_conf_gate),
                 conf_gate_detach=bool(args.conf_gate_detach),
+                conf_weight_detach=bool(args.conf_weight_detach),
                 conf_gate_floor=float(args.conf_gate_floor),
                 conf_gate_gamma=float(args.conf_gate_gamma),
                 conf_gate_strength=float(conf_gate_strength),
@@ -395,6 +458,8 @@ def main():
             dt = time.time() - t0
             with torch.no_grad():
                 l1_full = (pred_rgb - tgt_img).abs().mean()
+                psnr_full = _psnr(pred_rgb, tgt_img)
+                ssim_full = _ssim(pred_rgb, tgt_img)
                 train_mean = train_mask.float().mean()
                 weight_mean = recon_weight.float().mean()
                 weight_ratio = weight_mean / (train_mean + 1e-8)
@@ -434,6 +499,8 @@ def main():
             print(
                 f'step {step:04d}  loss={float(loss.item()):.6f}  '
                 f'l1_full={float(l1_full.item()):.6f}  '
+                f'psnr={psnr_full:.2f}  '
+                f'ssim={ssim_full:.4f}  '
                 f'w_mean={float(weight_mean.item()):.6f}  '
                 f'train_mean={float(train_mean.item()):.6f}  '
                 f'w_over_train={float(weight_ratio.item()):.6f}  '
@@ -470,6 +537,18 @@ def main():
                   f'renorm={int(aux_masks.get("recon_weight_renorm", 0))} '
                   f'clip_max={float(aux_masks.get("recon_weight_clip_max", 1.0)):.3f} '
                   f'gate_gamma={float(aux_masks.get("conf_gate_gamma", 1.0)):.3f}')
+            with open(metrics_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "step": int(step),
+                    "loss": float(loss.item()),
+                    "l1_full": float(l1_full.item()),
+                    "psnr": float(psnr_full),
+                    "ssim": float(ssim_full),
+                    "train_mean": float(train_mean.item()),
+                    "weight_mean": float(weight_mean.item()),
+                    "gate_strength": float(conf_gate_strength),
+                    "time_sec": float(dt),
+                }) + "\n")
 
         if step % 100 == 0 or step in (1,):
             model.eval()
@@ -479,14 +558,18 @@ def main():
                 'gate_loss': aux_masks.get('gate_loss', None),
                 'tgt_depth_conf': aux_masks.get('tgt_depth_conf', None),
                 'tgt_depth_conf_raw': aux_masks.get('tgt_depth_conf_raw', None),
+                'tgt_depth': batch.get('tgt_depth', None),
                 'fg_mask': fg_mask.detach(),
                 'train_mask': train_mask.detach(),
                 'recon_weight_raw': aux_masks.get('recon_weight_raw', None),
                 'recon_weight': recon_weight.detach(),
                 'valid_mask': valid_mask.detach(),
             }
+            if isinstance(aux, dict) and aux.get("pred_depth", None) is not None:
+                aux_dbg["pred_depth"] = aux.get("pred_depth")
             save_debug_pack(pred_rgb.detach(), tgt_img.detach(), aux_dbg, step,
-                            out_dir=out_dir, prefix=f'overfit_i{idx}', split_cat_panels=True)
+                            out_dir=out_dir, prefix=f'overfit_i{idx}', split_cat_panels=True,
+                            fixed_ranges=vis_ranges)
 
             diff_against = str(args.diff_against).strip()
             if diff_against and os.path.abspath(diff_against) != os.path.abspath(out_dir):

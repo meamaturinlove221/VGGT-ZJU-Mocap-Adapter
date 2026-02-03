@@ -27,12 +27,18 @@ from typing import Dict, Any, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+import numpy as np
 
 try:
     from torchvision.utils import save_image, make_grid
 except Exception:
     save_image = None
     make_grid = None
+try:
+    from PIL import Image, ImageDraw
+except Exception:
+    Image = None
+    ImageDraw = None
 
 
 # -----------------------------
@@ -178,6 +184,34 @@ def quantile_train_mask(pred_conf: torch.Tensor, cover: float) -> torch.Tensor:
 
 
 @torch.no_grad()
+def _save_reliability_plot(path: str, mean_conf, acc):
+    if Image is None or ImageDraw is None:
+        return
+    if mean_conf is None or acc is None:
+        return
+    import numpy as _np
+    mc = _np.asarray(mean_conf)
+    ac = _np.asarray(acc)
+    if mc.size == 0 or ac.size == 0:
+        return
+    W, H = 800, 480
+    pad = 50
+    img = Image.new("RGB", (W, H), color=(255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    # axes
+    draw.line([(pad, H - pad), (W - pad, H - pad)], fill=(0, 0, 0), width=2)
+    draw.line([(pad, pad), (pad, H - pad)], fill=(0, 0, 0), width=2)
+    # diagonal
+    draw.line([(pad, H - pad), (W - pad, pad)], fill=(180, 180, 180), width=1)
+    # points
+    for x, y in zip(mc, ac):
+        if _np.isnan(x) or _np.isnan(y):
+            continue
+        px = pad + float(x) * (W - 2 * pad)
+        py = H - pad - float(y) * (H - 2 * pad)
+        r = 3
+        draw.ellipse([(px - r, py - r), (px + r, py + r)], fill=(255, 0, 0))
+    img.save(path)
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", type=str, default=r"ckpt\viewdec_ablation_best_epoch19.pth")
@@ -195,6 +229,12 @@ def main():
                         choices=["none", "tgt_conf", "tgt_depth_conf"],
                         help="评测时用哪个 GT mask 作为有效像素")
     parser.add_argument("--save_png", action="store_true", help="强制保存 png（默认保存）")
+    parser.add_argument("--conf_calib_bins", type=int, default=10,
+                        help="Bins for confidence calibration")
+    parser.add_argument("--conf_calib_err_clip", type=float, default=0.1,
+                        help="Normalize error by this clip for calibration (err/clip in [0,1])")
+    parser.add_argument("--conf_calib_save", action="store_true", default=True,
+                        help="Save reliability diagram and calibration json")
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -314,6 +354,11 @@ def main():
     t0 = time.time()
     metrics_sum = {"l1": 0.0, "psnr": 0.0, "ssim": 0.0, "conf_err_corr": 0.0}
     metrics_n = 0
+    calib_bins = int(args.conf_calib_bins)
+    calib_err_clip = float(args.conf_calib_err_clip)
+    bin_count = np.zeros(calib_bins, dtype=np.float64)
+    bin_conf = np.zeros(calib_bins, dtype=np.float64)
+    bin_err = np.zeros(calib_bins, dtype=np.float64)
 
     vis_dir = os.path.join(args.out_dir, f"vis_{args.split}")
     os.makedirs(vis_dir, exist_ok=True)
@@ -453,6 +498,25 @@ def main():
         conf = conf.float().clamp(0, 1)
         err_map = (pred - tgt).abs().mean(dim=1, keepdim=True)
         corr = conf_error_corr(conf, err_map, valid)
+        # calibration accumulate
+        if calib_bins > 0:
+            err_clip = max(calib_err_clip, 1e-6)
+            err_norm = (err_map / err_clip).clamp(0, 1)
+            if valid is not None:
+                m = (valid > 0.5)
+                conf_flat = conf[m].flatten()
+                err_flat = err_norm[m].flatten()
+            else:
+                conf_flat = conf.flatten()
+                err_flat = err_norm.flatten()
+            if conf_flat.numel() > 0:
+                bin_idx = (conf_flat * calib_bins).long().clamp(0, calib_bins - 1)
+                cnt = torch.bincount(bin_idx, minlength=calib_bins).float()
+                sum_c = torch.bincount(bin_idx, weights=conf_flat, minlength=calib_bins).float()
+                sum_e = torch.bincount(bin_idx, weights=err_flat, minlength=calib_bins).float()
+                bin_count += cnt.detach().cpu().numpy()
+                bin_conf += sum_c.detach().cpu().numpy()
+                bin_err += sum_e.detach().cpu().numpy()
 
         metrics_sum["l1"] += l1v
         metrics_sum["psnr"] += ps
@@ -473,6 +537,36 @@ def main():
 
     elapsed = time.time() - t0
     mean_metrics = {k: (v / max(1, metrics_n)) for k, v in metrics_sum.items()}
+    # calibration summary
+    calib = {}
+    total_cnt = float(bin_count.sum())
+    if total_cnt > 0:
+        mean_conf = bin_conf / (bin_count + 1e-8)
+        mean_err = bin_err / (bin_count + 1e-8)
+        acc = 1.0 - mean_err
+        gap = np.abs(mean_conf - acc)
+        ece = float((gap * (bin_count / (total_cnt + 1e-8))).sum())
+        mce = float(gap.max())
+        calib = {
+            'bins': int(calib_bins),
+            'err_clip': float(calib_err_clip),
+            'bin_count': bin_count.tolist(),
+            'mean_conf': mean_conf.tolist(),
+            'mean_err': mean_err.tolist(),
+            'acc': acc.tolist(),
+            'ece': ece,
+            'mce': mce,
+        }
+        mean_metrics['conf_ece'] = ece
+        mean_metrics['conf_mce'] = mce
+        mean_metrics['conf_calib_bins'] = int(calib_bins)
+        mean_metrics['conf_calib_err_clip'] = float(calib_err_clip)
+        if args.conf_calib_save:
+            calib_path = os.path.join(args.out_dir, f'calibration_{args.split}.json')
+            with open(calib_path, 'w', encoding='utf-8') as f:
+                json.dump(calib, f, indent=2, ensure_ascii=False)
+            plot_path = os.path.join(args.out_dir, f'calibration_{args.split}.png')
+            _save_reliability_plot(plot_path, mean_conf, acc)
     mean_metrics["num_batches"] = metrics_n
     mean_metrics["num_samples"] = i_global
     mean_metrics["elapsed_sec"] = elapsed

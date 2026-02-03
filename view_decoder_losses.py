@@ -46,6 +46,83 @@ def masked_l1(
     return diff.sum() / denom
 
 
+def masked_charbonnier(
+    pred: torch.Tensor,
+    tgt: torch.Tensor,
+    mask01: Optional[torch.Tensor] = None,
+    eps: float = 1e-3,
+    alpha: float = 0.5,
+) -> torch.Tensor:
+    """
+    Charbonnier loss: (diff^2 + eps^2)^{alpha}
+    """
+    diff = pred - tgt
+    loss = (diff * diff + (eps * eps)).pow(alpha)
+    if mask01 is None:
+        return loss.mean()
+    m = _as_1chw(mask01, pred)
+    if m.shape[1] == 1 and pred.shape[1] != 1:
+        m = m.expand(-1, pred.shape[1], -1, -1)
+    loss = loss * m
+    denom = m.sum().clamp_min(1e-8)
+    return loss.sum() / denom
+
+
+def masked_huber(
+    pred: torch.Tensor,
+    tgt: torch.Tensor,
+    mask01: Optional[torch.Tensor] = None,
+    delta: float = 0.01,
+) -> torch.Tensor:
+    """
+    Huber loss (smooth L1) with delta threshold.
+    """
+    diff = (pred - tgt).abs()
+    delta = float(delta)
+    loss = torch.where(diff <= delta, 0.5 * diff * diff / (delta + 1e-8), diff - 0.5 * delta)
+    if mask01 is None:
+        return loss.mean()
+    m = _as_1chw(mask01, pred)
+    if m.shape[1] == 1 and pred.shape[1] != 1:
+        m = m.expand(-1, pred.shape[1], -1, -1)
+    loss = loss * m
+    denom = m.sum().clamp_min(1e-8)
+    return loss.sum() / denom
+
+
+def edge_aware_depth_smoothness(
+    depth: torch.Tensor,
+    rgb: torch.Tensor,
+    mask01: Optional[torch.Tensor] = None,
+    alpha: float = 10.0,
+) -> torch.Tensor:
+    """
+    Edge-aware smoothness: encourage small depth gradients where RGB is smooth.
+    depth: (B,1,H,W), rgb: (B,3,H,W)
+    """
+    if depth.dim() == 3:
+        depth = depth[:, None, ...]
+    if rgb.dim() == 3:
+        rgb = rgb[:, None, ...]
+    depth_dx = (depth[:, :, :, 1:] - depth[:, :, :, :-1]).abs()
+    depth_dy = (depth[:, :, 1:, :] - depth[:, :, :-1, :]).abs()
+    img_dx = (rgb[:, :, :, 1:] - rgb[:, :, :, :-1]).abs().mean(dim=1, keepdim=True)
+    img_dy = (rgb[:, :, 1:, :] - rgb[:, :, :-1, :]).abs().mean(dim=1, keepdim=True)
+    wx = torch.exp(-alpha * img_dx)
+    wy = torch.exp(-alpha * img_dy)
+    loss = (depth_dx * wx).mean() + (depth_dy * wy).mean()
+    if mask01 is None:
+        return loss
+    m = _as_1chw(mask01, depth)
+    if m.shape[-2:] != depth.shape[-2:]:
+        m = F.interpolate(m, size=depth.shape[-2:], mode="nearest")
+    mx = m[:, :, :, 1:]
+    my = m[:, :, 1:, :]
+    num = (depth_dx * wx * mx).sum() + (depth_dy * wy * my).sum()
+    den = mx.sum() + my.sum()
+    return num / den.clamp_min(1e-8)
+
+
 @torch.no_grad()
 def split_l1_fg_bg(
     pred: torch.Tensor,

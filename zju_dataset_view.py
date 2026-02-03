@@ -1,5 +1,6 @@
 # zju_dataset_view.py
 import os
+import argparse
 import os.path as osp
 import re
 import numpy as np
@@ -27,6 +28,8 @@ class ZJUViewSynthDataset(Dataset):
         tgt_view_names=None,
         tgt_view_ids_exclude=None,
         tgt_view_names_exclude=None,
+        return_cam: bool = False,
+        return_paths: bool = False,
     ):
         """
         读取 precompute_zju_vggt_geom.py 生成的 npz（vggt_geom/*.npz）
@@ -57,6 +60,8 @@ class ZJUViewSynthDataset(Dataset):
         self._tgt_view_names_raw = tgt_view_names
         self._tgt_view_ids_exclude_raw = tgt_view_ids_exclude
         self._tgt_view_names_exclude_raw = tgt_view_names_exclude
+        self.return_cam = bool(return_cam)
+        self.return_paths = bool(return_paths)
 
         # --- 收集所有帧（all samples） ---
         all_samples = []
@@ -344,6 +349,8 @@ class ZJUViewSynthDataset(Dataset):
         depth = data["depth"]         # (V,Hd,Wd) or (V,Hd,Wd,1)
         depth_conf = data["depth_conf"]    # (V,Hd,Wd) or (V,Hd,Wd,1)
         pointmap = data["pointmap"]      # (V,Hd,Wd,3)
+        extrinsic = data["extrinsic"] if "extrinsic" in data else None
+        intrinsic = data["intrinsic"] if "intrinsic" in data else None
 
         V = int(img_paths.shape[0])
         if V < 2:
@@ -481,4 +488,107 @@ class ZJUViewSynthDataset(Dataset):
             "tgt_vid": torch.tensor(tgt_vid, dtype=torch.long),
             "src_vids": torch.tensor(src_vids, dtype=torch.long),
         }
+        if self.return_cam and (extrinsic is not None) and (intrinsic is not None):
+            try:
+                src_T = torch.from_numpy(extrinsic[src_idxs]).float()
+                src_K = torch.from_numpy(intrinsic[src_idxs]).float()
+                tgt_T = torch.from_numpy(extrinsic[tgt_idx]).float()
+                tgt_K = torch.from_numpy(intrinsic[tgt_idx]).float()
+                sample.update({
+                    "src_T": src_T,
+                    "src_K": src_K,
+                    "tgt_T": tgt_T,
+                    "tgt_K": tgt_K,
+                })
+            except Exception:
+                pass
+        if self.return_paths:
+            try:
+                sample.update({
+                    "geom_path": geom_path,
+                    "tgt_img_path": tgt_img_path,
+                    "src_img_paths": [self._resolve_img_path(img_paths[i]) for i in src_idxs],
+                    "cam_names": cam_names if cam_names is not None else None,
+                })
+            except Exception:
+                pass
         return sample
+
+
+
+def _dump_one_batch_from_args(args):
+    seq_names = args.seq_names
+    if isinstance(seq_names, str):
+        seq_names = [s for s in re.split(r"[,\s]+", seq_names) if s]
+    ds = ZJUViewSynthDataset(
+        root=args.zju_root,
+        seq_names=seq_names,
+        num_src_views=int(args.num_src_views),
+        frame_subsample=int(args.frame_subsample),
+        split=None if args.split == "None" else args.split,
+        train_ratio=float(args.train_ratio),
+        split_seed=int(args.split_seed),
+        split_mode=str(args.split_mode),
+        deterministic_views=bool(args.deterministic_views),
+        view_seed=int(args.view_seed),
+        tgt_view_ids=args.tgt_view_ids,
+        tgt_view_names=args.tgt_view_names,
+        tgt_view_ids_exclude=args.tgt_view_ids_exclude,
+        tgt_view_names_exclude=args.tgt_view_names_exclude,
+        return_cam=True,
+        return_paths=True,
+    )
+    if len(ds) == 0:
+        raise SystemExit("dataset empty")
+    idx = int(args.index) % len(ds)
+    sample = ds[idx]
+
+    def _to_np(x):
+        if torch.is_tensor(x):
+            return x.detach().cpu().numpy()
+        return x
+
+    out = {}
+    keep_keys = [
+        "src_imgs", "src_depth", "src_depth_conf", "src_pointmap",
+        "tgt_img", "tgt_depth", "tgt_depth_conf", "tgt_pointmap",
+        "src_K", "src_T", "tgt_K", "tgt_T",
+        "src_vids", "tgt_vid",
+        "geom_path", "tgt_img_path", "src_img_paths", "cam_names",
+    ]
+    for k in keep_keys:
+        if k in sample:
+            out[k] = _to_np(sample[k])
+    out["index"] = np.array([idx], dtype=np.int64)
+    os.makedirs(os.path.dirname(args.dump_one_batch) or ".", exist_ok=True)
+    np.savez_compressed(args.dump_one_batch, **out)
+    print(f"[dump_one_batch] saved: {args.dump_one_batch}")
+
+
+def _build_dump_parser():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dump_one_batch", type=str, default="")
+    ap.add_argument("--zju_root", type=str, required=True)
+    ap.add_argument("--seq_names", type=str, required=True)
+    ap.add_argument("--index", type=int, default=0)
+    ap.add_argument("--split", type=str, default="train",
+                    choices=["train", "val", "test", "None"])
+    ap.add_argument("--num_src_views", type=int, default=3)
+    ap.add_argument("--frame_subsample", type=int, default=1)
+    ap.add_argument("--train_ratio", type=float, default=0.9)
+    ap.add_argument("--split_seed", type=int, default=0)
+    ap.add_argument("--split_mode", type=str, default="random")
+    ap.add_argument("--deterministic_views", action="store_true", default=True)
+    ap.add_argument("--view_seed", type=int, default=2025)
+    ap.add_argument("--tgt_view_ids", type=str, default=None)
+    ap.add_argument("--tgt_view_names", type=str, default=None)
+    ap.add_argument("--tgt_view_ids_exclude", type=str, default=None)
+    ap.add_argument("--tgt_view_names_exclude", type=str, default=None)
+    return ap
+
+
+if __name__ == "__main__":
+    parser = _build_dump_parser()
+    args = parser.parse_args()
+    if args.dump_one_batch:
+        _dump_one_batch_from_args(args)

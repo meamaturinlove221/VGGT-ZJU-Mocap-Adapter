@@ -6,6 +6,7 @@ import re
 from types import SimpleNamespace
 from typing import Any, Dict, Optional, Tuple
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -374,6 +375,60 @@ def _filter_existing_seq_names(seq_names, zju_root):
     return existing, missing
 
 
+def export_2dgs_npz(path: str, pred_rgb: torch.Tensor, pred_conf: torch.Tensor, depth_map: Optional[torch.Tensor],
+                     conf_thr: float = 0.2, max_points: int = 20000, stride: int = 1) -> bool:
+    try:
+        if pred_rgb.dim() == 4:
+            pred_rgb = pred_rgb[0]
+        if pred_conf.dim() == 4:
+            pred_conf = pred_conf[0, 0]
+        if pred_conf.dim() == 3:
+            pred_conf = pred_conf[0]
+        if depth_map is not None:
+            if depth_map.dim() == 4:
+                depth_map = depth_map[0, 0]
+            elif depth_map.dim() == 3:
+                depth_map = depth_map[0]
+        H, W = int(pred_conf.shape[-2]), int(pred_conf.shape[-1])
+        conf = pred_conf
+        if stride and int(stride) > 1:
+            s = int(stride)
+            conf = conf[::s, ::s]
+            if depth_map is not None:
+                depth_map = depth_map[::s, ::s]
+            pred_rgb = pred_rgb[:, ::s, ::s]
+            H, W = int(conf.shape[-2]), int(conf.shape[-1])
+        mask = conf >= float(conf_thr)
+        if depth_map is not None:
+            mask = mask & (depth_map > 0)
+        idx = mask.nonzero(as_tuple=False)
+        if idx.numel() == 0:
+            return False
+        if max_points and int(max_points) > 0 and idx.shape[0] > int(max_points):
+            perm = torch.randperm(idx.shape[0], device=idx.device)[:int(max_points)]
+            idx = idx[perm]
+        y = idx[:, 0]
+        x = idx[:, 1]
+        rgb = pred_rgb[:, y, x].permute(1, 0).contiguous()  # (N,3)
+        alpha = conf[y, x].contiguous()
+        if depth_map is None:
+            depth = torch.ones_like(alpha)
+        else:
+            depth = depth_map[y, x].contiguous()
+        uv = torch.stack([x.float(), y.float()], dim=1)
+        np.savez_compressed(
+            path,
+            uv=uv.detach().cpu().numpy(),
+            depth=depth.detach().cpu().numpy(),
+            rgb=rgb.detach().cpu().numpy(),
+            alpha=alpha.detach().cpu().numpy(),
+            height=H,
+            width=W,
+            conf_thr=float(conf_thr),
+        )
+        return True
+    except Exception:
+        return False
 def main():
     import argparse
 
@@ -434,7 +489,23 @@ def main():
     parser.add_argument("--view_affine_strength", type=float, default=None)
     parser.add_argument("--view_cond_mode", type=str, default=None,
                         choices=["tgt", "tgt_src_mean"])
+    parser.add_argument("--vis_conf_min", type=float, default=0.0)
+    parser.add_argument("--vis_conf_max", type=float, default=1.0)
+    parser.add_argument("--vis_depth_min", type=float, default=0.0)
+    parser.add_argument("--vis_depth_max", type=float, default=5.0)
+    parser.add_argument("--vis_mask_min", type=float, default=0.0)
+    parser.add_argument("--vis_mask_max", type=float, default=1.0)
+    parser.add_argument("--vis_weight_min", type=float, default=0.0)
+    parser.add_argument("--vis_weight_max", type=float, default=1.0)
 
+    parser.add_argument("--export_2dgs", action="store_true", default=False,
+                        help="Export lightweight 2DGS npz per saved sample")
+    parser.add_argument("--gs_conf_thr", type=float, default=0.2)
+    parser.add_argument("--gs_max_points", type=int, default=20000)
+    parser.add_argument("--gs_stride", type=int, default=1)
+    parser.add_argument("--gs_use_tgt_depth", action="store_true", default=True)
+    parser.add_argument("--no_gs_use_tgt_depth", dest="gs_use_tgt_depth",
+                        action="store_false", help="Do not fallback to tgt_depth for 2DGS export")
     args = parser.parse_args()
 
     # --- import train-time helpers (exact same metric/mask/vis code) ---
@@ -447,6 +518,7 @@ def main():
         psnr,
         ssim,
         save_debug_pack,
+        build_vis_ranges,
     )
     from zju_dataset_view import ZJUViewSynthDataset
     from view_decoder_ablation import GeomViewDecoderAblation
@@ -462,6 +534,8 @@ def main():
     ckpt = load_checkpoint(args.ckpt, device="cpu")
     ckpt_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
     cfg = build_cfg_from_ckpt_and_cli(ckpt_args, args)
+
+    vis_ranges = build_vis_ranges(args)
 
     if cfg.zju_root is None:
         raise ValueError(
@@ -528,6 +602,7 @@ def main():
         conf_gate_detach=bool(getattr(cfg, "conf_gate_detach", False)),
         conf_gate_floor=float(getattr(cfg, "conf_gate_floor", 0.0)),
         logit_clip=float(getattr(cfg, "logit_clip", 0.0)),
+        use_depth_head=bool(getattr(cfg, "use_depth_head", False)),
     )
     # these are used inside model forward
     model.conf_thr = float(getattr(cfg, "conf_thr", 0.6))
@@ -790,6 +865,7 @@ def main():
                     "pred_conf": pred_conf_safe.detach(),
                     "tgt_depth_conf": aux_masks.get("tgt_depth_conf", None),
                     "tgt_depth_conf_raw": aux_masks.get("tgt_depth_conf_raw", None),
+                    "tgt_depth": batch.get("tgt_depth", None),
                     "fg_mask": fg_mask.detach(),
                     "train_mask": train_mask.detach(),
                     "recon_weight": recon_weight.detach(),
@@ -797,6 +873,8 @@ def main():
                 }
                 if isinstance(aux_pred, dict) and aux_pred.get("gate", None) is not None:
                     aux_dbg["gate"] = aux_pred.get("gate")
+                if isinstance(aux_pred, dict) and aux_pred.get("pred_depth", None) is not None:
+                    aux_dbg["pred_depth"] = aux_pred.get("pred_depth")
                 save_debug_pack(
                     pred_rgb,
                     tgt_img,
@@ -804,7 +882,24 @@ def main():
                     global_step + i,
                     out_dir=args.out_dir,
                     prefix=f"infer_{cfg.split}_e{epoch:03d}",
+                    fixed_ranges=vis_ranges,
                 )
+                if args.export_2dgs:
+                    depth_src = None
+                    if isinstance(aux_pred, dict) and aux_pred.get("pred_depth", None) is not None:
+                        depth_src = aux_pred.get("pred_depth")
+                    elif args.gs_use_tgt_depth:
+                        depth_src = batch.get("tgt_depth", None)
+                    gs_path = os.path.join(args.out_dir, f"gaussians_{sid:06d}.npz")
+                    export_2dgs_npz(
+                        gs_path,
+                        pred_rgb.detach(),
+                        pred_conf_safe.detach(),
+                        depth_src,
+                        conf_thr=float(args.gs_conf_thr),
+                        max_points=int(args.gs_max_points),
+                        stride=int(args.gs_stride),
+                    )
                 saved += 1
 
     mean_wl1 = sum_wl1 / max(n, 1)

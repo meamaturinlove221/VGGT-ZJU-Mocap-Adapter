@@ -1,5 +1,7 @@
 import os
 import glob
+import json
+import argparse
 import numpy as np
 try:
     import cv2
@@ -104,7 +106,55 @@ def ssim_simple(x, y, eps=1e-6):
     return float(np.mean(num / (den + eps)))
 
 
-def main(out_dir):
+def _load_metrics_jsonl(out_dir: str):
+    path = os.path.join(out_dir, "metrics.jsonl")
+    if not os.path.isfile(path):
+        return None
+    rows = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                continue
+    if not rows:
+        return None
+    # best by psnr then ssim
+    best = max(rows, key=lambda r: (float(r.get("psnr", -1)), float(r.get("ssim", -1))))
+    last = rows[-1]
+    return {"rows": rows, "best": best, "last": last}
+
+
+def _print_metrics_summary(tag: str, metrics):
+    if metrics is None:
+        return
+    best = metrics["best"]
+    last = metrics["last"]
+    print(f"[{tag}] best: step={best.get('step')} psnr={best.get('psnr'):.2f} ssim={best.get('ssim'):.4f} l1={best.get('l1_full'):.6f}")
+    print(f"[{tag}] last: step={last.get('step')} psnr={last.get('psnr'):.2f} ssim={last.get('ssim'):.4f} l1={last.get('l1_full'):.6f}")
+
+
+def main(out_dir, compare_dir=None):
+    metrics = _load_metrics_jsonl(out_dir)
+    if metrics is not None:
+        print(f"found metrics.jsonl in {out_dir}")
+        _print_metrics_summary("current", metrics)
+        if compare_dir:
+            base = _load_metrics_jsonl(compare_dir)
+            if base is None:
+                print(f"[warn] no metrics.jsonl in compare_dir={compare_dir}")
+            else:
+                _print_metrics_summary("baseline", base)
+                b = base["best"]
+                c = metrics["best"]
+                print(f"[delta(best)] psnr={c.get('psnr') - b.get('psnr'):+.2f} "
+                      f"ssim={c.get('ssim') - b.get('ssim'):+.4f} "
+                      f"l1={c.get('l1_full') - b.get('l1_full'):+.6f}")
+        return
+
     cat_paths = sorted(glob.glob(os.path.join(
         out_dir, "*cat*pred*tgt*step*.png")))
     cat_paths = [
@@ -138,6 +188,8 @@ def main(out_dir):
 
 
 if __name__ == "__main__":
-
-    import sys
-    main(sys.argv[1] if len(sys.argv) > 1 else "infer_vis/val_e104")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("out_dir", nargs="?", default="infer_vis/val_e104")
+    ap.add_argument("--compare", type=str, default="")
+    args = ap.parse_args()
+    main(args.out_dir, compare_dir=(args.compare or None))

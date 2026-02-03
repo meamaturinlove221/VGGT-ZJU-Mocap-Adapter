@@ -12,6 +12,20 @@ from PIL import Image
 import torch
 import torch.nn.functional as F
 
+try:
+    import cv2  # type: ignore
+    _HAVE_CV2 = True
+except Exception:
+    cv2 = None
+    _HAVE_CV2 = False
+
+try:
+    from scipy import ndimage as _scipy_ndimage  # type: ignore
+    _HAVE_SCIPY = True
+except Exception:
+    _scipy_ndimage = None
+    _HAVE_SCIPY = False
+
 
 def ensure_4d(x: torch.Tensor) -> torch.Tensor:
     """
@@ -211,6 +225,154 @@ def cover_ratio(mask01: torch.Tensor) -> float:
     return float(m.float().mean().item())
 
 
+def _erode_mask(mask01: torch.Tensor, k: int = 3) -> torch.Tensor:
+    if k <= 1:
+        return mask01
+    m = ensure_4d(mask01.float())
+    pad = k // 2
+    inv = 1.0 - m
+    eroded = 1.0 - F.max_pool2d(inv, kernel_size=k, stride=1, padding=pad)
+    eroded = (eroded > 0.5).float()
+    return eroded.squeeze(0)
+
+
+def _count_connected_components(mask01: torch.Tensor) -> int:
+    m = mask01
+    if m.dim() == 3:
+        m = m[0]
+    if m.dim() != 2:
+        raise ValueError(f"count_cc expects 2D/3D mask, got {m.shape}")
+    m_np = (m > 0.5).detach().cpu().numpy().astype(np.uint8)
+    if m_np.sum() == 0:
+        return 0
+    if _HAVE_CV2 and cv2 is not None:
+        try:
+            num, _labels = cv2.connectedComponents(m_np, connectivity=4)
+            return max(0, int(num) - 1)
+        except Exception:
+            pass
+    if _HAVE_SCIPY and _scipy_ndimage is not None:
+        try:
+            _labels, num = _scipy_ndimage.label(m_np)
+            return int(num)
+        except Exception:
+            pass
+    # fallback: simple DFS (slow for huge masks, OK for debug)
+    H, W = m_np.shape
+    visited = np.zeros_like(m_np, dtype=np.uint8)
+    cc = 0
+    for y in range(H):
+        for x in range(W):
+            if m_np[y, x] == 0 or visited[y, x]:
+                continue
+            cc += 1
+            stack = [(y, x)]
+            visited[y, x] = 1
+            while stack:
+                cy, cx = stack.pop()
+                for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                    if 0 <= ny < H and 0 <= nx < W and m_np[ny, nx] and not visited[ny, nx]:
+                        visited[ny, nx] = 1
+                        stack.append((ny, nx))
+    return int(cc)
+
+
+def mask_stats(mask01: torch.Tensor, name: str = "") -> Dict[str, float]:
+    m = mask01
+    if m is None:
+        return {f"{name}cover": 0.0, f"{name}cc": 0, f"{name}boundary": 0.0}
+    if m.dim() == 4:
+        m = m[0]
+    if m.dim() == 3 and m.shape[0] != 1:
+        m = m[:1]
+    if m.dim() == 3:
+        m2 = m[0]
+    else:
+        m2 = m
+    m2 = (m2 > 0.5).float()
+    cover = float(m2.mean().item())
+    cc = _count_connected_components(m2)
+    er = _erode_mask(m2, k=3)
+    boundary = (m2 - er).clamp(0, 1)
+    boundary_ratio = float(boundary.sum().item() / (m2.sum().item() + 1e-8))
+    return {
+        f"{name}cover": cover,
+        f"{name}cc": float(cc),
+        f"{name}boundary": boundary_ratio,
+    }
+
+
+def compose_masks(
+    valid_geom: torch.Tensor,
+    fg_mask: Optional[torch.Tensor],
+    conf_mask: Optional[torch.Tensor],
+    mode: str = "geom_fg_conf",
+    min_gate: float = 0.05,
+    return_stats: bool = True,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    Compose masks with explicit physical meaning.
+    mode:
+      - geom_fg_conf: valid_geom * fg * conf
+      - geom_fg: valid_geom * fg
+      - geom_conf: valid_geom * conf
+      - geom_only: valid_geom
+      - fg_conf: fg * conf
+      - fg_only: fg
+      - conf_only: conf
+    """
+    v = binarize(valid_geom)
+    if fg_mask is None:
+        fg = torch.ones_like(v)
+    else:
+        fg = binarize(fg_mask)
+        if fg.shape[-2:] != v.shape[-2:]:
+            fg = resize_mask_nearest(fg, v.shape[-2:])
+            fg = binarize(fg)
+
+    if conf_mask is None:
+        conf = torch.ones_like(v)
+    else:
+        conf = conf_mask.float()
+        if conf.dim() == 2:
+            conf = conf[None, None, ...]
+        if conf.dim() == 3:
+            conf = conf.unsqueeze(1)
+        if conf.shape[1] != 1:
+            conf = conf[:, :1, ...]
+        if conf.shape[-2:] != v.shape[-2:]:
+            conf = F.interpolate(conf, size=v.shape[-2:], mode="bilinear", align_corners=False)
+        conf = conf.clamp(0.0, 1.0)
+        if float(min_gate) > 0:
+            conf = float(min_gate) + (1.0 - float(min_gate)) * conf
+
+    m = str(mode).lower()
+    if m == "geom_fg_conf":
+        out = v * fg * conf
+    elif m == "geom_fg":
+        out = v * fg
+    elif m == "geom_conf":
+        out = v * conf
+    elif m == "geom_only":
+        out = v
+    elif m == "fg_conf":
+        out = fg * conf
+    elif m == "fg_only":
+        out = fg
+    elif m == "conf_only":
+        out = conf
+    else:
+        out = v * fg * conf
+
+    out = out.clamp(0.0, 1.0)
+    stats: Dict[str, float] = {}
+    if return_stats:
+        stats.update(mask_stats(v, "valid_"))
+        stats.update(mask_stats(fg, "fg_"))
+        stats.update(mask_stats(conf, "conf_"))
+        stats.update(mask_stats(out, "out_"))
+    return out, stats
+
 def overlay_mask_pil(
     img_chw: torch.Tensor,
     mask01_hw: torch.Tensor,
@@ -251,7 +413,7 @@ def save_overlay_triplet(
     os.makedirs(out_dir, exist_ok=True)
 
     # base
-    base = tgt_img_chw.detach().cpu().flosat()
+    base = tgt_img_chw.detach().cpu().float()
     if base.max() <= 1.0:
         base = base * 255.0
     base = base.clamp(0, 255).byte().permute(1, 2, 0).numpy()

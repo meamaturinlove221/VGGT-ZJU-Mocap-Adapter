@@ -133,6 +133,7 @@ class GeomViewDecoder(nn.Module):
         split_conf_head: bool = False,
         logit_clip: float = 0.0,
         conf_bias_init: float = None,
+        use_depth_head: bool = False,
     ):
         super().__init__()
         C = base_channels
@@ -146,6 +147,7 @@ class GeomViewDecoder(nn.Module):
         self.split_conf_head = bool(split_conf_head)
         self.logit_clip = float(logit_clip)
         self.conf_bias_init = conf_bias_init
+        self.use_depth_head = bool(use_depth_head)
         self.view_embed = None
         self.view_to_gb = None
         self.view_to_rgb = None
@@ -199,6 +201,8 @@ class GeomViewDecoder(nn.Module):
             self.out_conf = nn.Conv2d(C, 1, kernel_size=3, padding=1)
         else:
             self.out_conv = nn.Conv2d(C, 4, kernel_size=3, padding=1)
+        if self.use_depth_head:
+            self.out_depth = nn.Conv2d(C, 1, kernel_size=3, padding=1)
         self._init_conf_bias(self.conf_bias_init)
 
     def _init_view_cond(self, num_views: int, view_dim: int):
@@ -284,6 +288,7 @@ class GeomViewDecoder(nn.Module):
         tgt_vid=None,
         src_vids=None,
         return_logits: bool = False,
+        return_depth: bool = False,
     ):
         """
         src_imgs:       (B,S,3,H,W)
@@ -384,6 +389,11 @@ class GeomViewDecoder(nn.Module):
                 out = out.clamp(min=-self.logit_clip, max=self.logit_clip)
             rgb_logits = out[:, :3, :, :]
             conf_logits = out[:, 3:4, :, :]
+        depth_logits = None
+        depth_out = None
+        if self.use_depth_head:
+            depth_logits = self.out_depth(u1)
+            depth_out = F.softplus(depth_logits)
         t_rgb = self.rgb_sigmoid_temp if self.rgb_sigmoid_temp > 0 else 1.0
         t_conf = self.conf_sigmoid_temp if self.conf_sigmoid_temp > 0 else 1.0
         rgb = torch.sigmoid(rgb_logits / t_rgb)         # (B,3,H,W)
@@ -391,6 +401,10 @@ class GeomViewDecoder(nn.Module):
 
         rgb = self._apply_view_affine(rgb, tgt_vid, src_vids)
 
+        if return_depth:
+            if return_logits:
+                return rgb, conf_out, depth_out, (rgb_logits, conf_logits, depth_logits)
+            return rgb, conf_out, depth_out
         if return_logits:
             return rgb, conf_out, (rgb_logits, conf_logits)
         return rgb, conf_out
