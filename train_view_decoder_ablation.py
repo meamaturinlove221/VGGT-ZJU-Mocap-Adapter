@@ -1758,76 +1758,54 @@ def dump_nan_guard(
         pass
 
 
-def log_param_groups(optimizer: torch.optim.Optimizer, model: nn.Module, max_names: int = 3) -> None:
+def log_param_groups(optimizer, model=None, batch=None, logger=print):
+    """Log optimizer param-groups safely.
+
+    Args:
+        optimizer: torch optimizer
+        model: optional nn.Module; if given, we map params -> names for samples
+        batch: optional dict-like; if given, we log keys and a few shapes
+        logger: callable
+    """
     try:
-        name_map = {id(p): n for n, p in model.named_parameters()}
-        for gi, g in enumerate(optimizer.param_groups):
+        id2name = {}
+        if model is not None:
+            try:
+                for n, p in model.named_parameters():
+                    id2name[id(p)] = n
+            except Exception:
+                id2name = {}
+
+        for gi, g in enumerate(getattr(optimizer, "param_groups", [])):
             params = g.get("params", [])
-            names = [name_map.get(id(p), "") for p in params if id(p) in name_map]
-            sample = ", ".join([n for n in names if n][:max_names])
             lr = g.get("lr", None)
             wd = g.get("weight_decay", None)
-            print(f"[lr_group {gi}] n_params={len(params)} lr={lr} wd={wd} sample={sample}")
-    except Exception as e:
-        print(f"[warn] param group logging failed: {e}")
-    try:
-        if model is not None:
-            torch.save({"model": model.state_dict()}, os.path.join(out_dir, "model_state.pt"))
-    except Exception:
-        pass
-    try:
-        if pred_rgb is not None and tgt_img is not None:
-            save_debug_pack(
-                pred_rgb.detach(),
-                tgt_img.detach(),
-                aux_dbg or {},
-                step=0,
-                out_dir=out_dir,
-                prefix="nan_guard",
-                split_cat_panels=False,
-                fixed_ranges=build_vis_ranges(args),
+            n_params = len(params)
+
+            sample = []
+            for p in params:
+                nm = id2name.get(id(p))
+                if nm is not None:
+                    sample.append(nm)
+                if len(sample) >= 3:
+                    break
+
+            logger(
+                f"[lr_group {gi}] n_params={n_params} lr={lr} wd={wd} "
+                f"sample={', '.join(sample) if sample else 'n/a'}"
             )
-    except Exception:
-        pass
-    if note:
-        try:
-            with open(os.path.join(out_dir, "note.txt"), "w", encoding="utf-8") as f:
-                f.write(str(note))
-        except Exception:
-            pass
-    if batch is not None:
-        try:
-            dump_batch_npz(batch, os.path.join(out_dir, "batch.npz"))
-        except Exception:
-            pass
-    # git hash
-    try:
-        res = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=str(_THIS_DIR),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if res.stdout:
-            with open(os.path.join(out_dir, "git.txt"), "w", encoding="utf-8") as f:
-                f.write(res.stdout.strip() + "\n")
-    except Exception:
-        pass
-    # pip freeze
-    try:
-        res = subprocess.run(
-            [sys.executable, "-m", "pip", "freeze"],
-            cwd=str(_THIS_DIR),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if res.stdout:
-            with open(os.path.join(out_dir, "pip_freeze.txt"), "w", encoding="utf-8") as f:
-                f.write(res.stdout)
-    except Exception:
-        pass
+
+        if batch is not None and hasattr(batch, "keys"):
+            keys = list(batch.keys())
+            logger(f"[batch] keys={keys}")
+            for k in keys[:8]:
+                v = batch[k]
+                shp = getattr(v, "shape", None)
+                if shp is not None:
+                    logger(f"  - {k}: shape={tuple(shp)}")
+
+    except Exception as e:
+        logger(f"[log_param_groups] warn: {type(e).__name__}: {e}")
 
 
 # ---------------------------

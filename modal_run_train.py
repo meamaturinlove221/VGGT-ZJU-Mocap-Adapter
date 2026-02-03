@@ -89,12 +89,18 @@ def _make_gpu_from_spec(spec: str):
         "a100-40g": "a100-40gb",
         "a100-40": "a100-40gb",
         "a100-40gb": "a100-40gb",
-        "a100": "a100",
+        "a100": "a100-80gb",
         "h100": "h100",
         "l40s": "l40s",
         "l40": "l40s",
     }
     s = alias.get(s, s)
+
+    # Modal now prefers string GPU specs for A100 (avoid modal.gpu.A100).
+    if s == "a100-80gb":
+        return "A100-80GB"
+    if s == "a100-40gb":
+        return "A100-40GB"
 
     # Try to construct modal.gpu.* objects if available
     try:
@@ -152,7 +158,7 @@ def _make_gpu_from_spec(spec: str):
     if s == "a100-40gb":
         return "A100-40GB"
     if s == "a100":
-        return "A100"
+        return "A100-80GB"
     if s == "h100":
         return "H100"
     if s == "l40s":
