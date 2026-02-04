@@ -326,7 +326,18 @@ class GeomViewDecoderAblation(nn.Module):
         if gate is not None:
             aux["gate"] = gate.detach()
         if return_aux and logits is not None:
-            rgb_logits, conf_logits = logits
+            # unpack logits (rgb, conf[, depth])
+            if isinstance(logits, (tuple, list)):
+                if len(logits) == 2:
+                    rgb_logits, conf_logits = logits
+                    depth_logits = None
+                elif len(logits) == 3:
+                    rgb_logits, conf_logits, depth_logits = logits
+                else:
+                    raise ValueError('unexpected logits tuple len=%d' % len(logits))
+            else:
+                rgb_logits, conf_logits = logits
+                depth_logits = None
             aux["rgb_logits"] = rgb_logits.detach()
             aux["conf_logits"] = conf_logits.detach()
         if delta is not None:

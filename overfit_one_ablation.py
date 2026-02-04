@@ -449,7 +449,8 @@ def main():
                 recon_weight_renorm=bool(args.recon_weight_renorm),
                 recon_weight_clip_max=float(args.recon_weight_clip_max),
             )
-            loss = masked_l1(pred_rgb, tgt_img, recon_weight)
+            recon_weight_loss = recon_weight.detach()
+            loss = masked_l1(pred_rgb, tgt_img, recon_weight_loss)
 
         loss.backward()
         opt.step()

@@ -30,6 +30,11 @@ class ZJUViewSynthDataset(Dataset):
         tgt_view_names_exclude=None,
         return_cam: bool = False,
         return_paths: bool = False,
+        bad_sample_policy: str = "warn",
+        white_mean_thr: float = 0.98,
+        white_std_thr: float = 1e-3,
+        report_bad_samples: bool = True,
+        bad_sample_max_retry: int = 3,
     ):
         """
         读取 precompute_zju_vggt_geom.py 生成的 npz（vggt_geom/*.npz）
@@ -62,6 +67,15 @@ class ZJUViewSynthDataset(Dataset):
         self._tgt_view_names_exclude_raw = tgt_view_names_exclude
         self.return_cam = bool(return_cam)
         self.return_paths = bool(return_paths)
+        self.bad_sample_policy = str(
+            bad_sample_policy or "warn").lower().replace("-", "_")
+        if self.bad_sample_policy not in ("warn", "skip", "raise", "mask", "drop_src"):
+            self.bad_sample_policy = "warn"
+        self.white_mean_thr = float(white_mean_thr)
+        self.white_std_thr = float(white_std_thr)
+        self.report_bad_samples = bool(report_bad_samples)
+        self.bad_sample_max_retry = int(bad_sample_max_retry)
+        self._reported_bad = set()
 
         # --- 收集所有帧（all samples） ---
         all_samples = []
@@ -339,7 +353,81 @@ class ZJUViewSynthDataset(Dataset):
                 f"depth={d.shape}, conf={c.shape}, pointmap={pm.shape}"
             )
 
-    def __getitem__(self, index):
+    def _img_stats(self, img_t):
+        if img_t is None:
+            return None
+        try:
+            if torch.is_tensor(img_t):
+                t = img_t.detach().float()
+            else:
+                t = torch.from_numpy(np.asarray(img_t)).float()
+            if t.numel() == 0:
+                return None
+            minv = float(t.min().item())
+            maxv = float(t.max().item())
+            mean = float(t.mean().item())
+            std = float(t.std(unbiased=False).item())
+            return minv, maxv, mean, std
+        except Exception:
+            return None
+
+    def _check_bad_image(self, img_t):
+        stats = self._img_stats(img_t)
+        if stats is None:
+            return True, None, ["empty_or_invalid"]
+        minv, maxv, mean, std = stats
+        reasons = []
+        if not np.isfinite([minv, maxv, mean, std]).all():
+            reasons.append("nonfinite")
+        if std < float(self.white_std_thr):
+            reasons.append("low_std")
+        if mean > float(self.white_mean_thr) and std < float(self.white_std_thr):
+            reasons.append("white_like")
+        if maxv > 1.05:
+            reasons.append("max_gt_1")
+        if minv < -0.05:
+            reasons.append("min_lt_0")
+        bad = len(reasons) > 0
+        return bad, stats, reasons
+
+    def _report_bad_samples(self, meta, index, bad_infos):
+        if not self.report_bad_samples:
+            return
+        geom_path = meta.get("geom_path", "")
+        seq = meta.get("seq", "")
+        frame_id = osp.splitext(osp.basename(geom_path))[0]
+        for info in bad_infos:
+            key = (
+                geom_path,
+                info.get("view_id", None),
+                info.get("role", ""),
+                info.get("img_path", ""),
+            )
+            if key in self._reported_bad:
+                continue
+            self._reported_bad.add(key)
+            cam_name = info.get("cam_name", None)
+            cam_name = cam_name if cam_name is not None else ""
+            view_idx = info.get("view_idx", None)
+            view_id = info.get("view_id", None)
+            reason = info.get("reason", "")
+            print(
+                f"[ZJUViewSynthDataset][bad_image] seq={seq} frame={frame_id} "
+                f"index={index} role={info.get('role','')} "
+                f"view_idx={view_idx} view_id={view_id} cam={cam_name}"
+            )
+            print(f"  geom={geom_path}")
+            print(f"  img={info.get('img_path','')}")
+            if info.get("stats", None) is not None:
+                minv, maxv, mean, std = info["stats"]
+                print(
+                    f"  stats: min={minv:.6f} max={maxv:.6f} "
+                    f"mean={mean:.6f} std={std:.6f} reason={reason}"
+                )
+            else:
+                print(f"  stats: <none> reason={reason}")
+
+    def __getitem__(self, index, _retry: int = 0):
         meta = self.samples[index]
         geom_path = meta["geom_path"]
 
@@ -404,19 +492,96 @@ class ZJUViewSynthDataset(Dataset):
             perm = rng.permutation(remaining)
             src_idxs = perm[:num_src]
 
-        src_vids = cam_ids[src_idxs]
         tgt_vid = cam_ids[tgt_idx]
+
+        policy = self.bad_sample_policy
+        bad_infos = []
+        bad_tgt_masked = False
+        tgt_is_bad = False
+
+        def _pick_next_index():
+            n = len(self.samples)
+            if n <= 1:
+                return index
+            j = int(np.random.randint(0, n - 1))
+            if j >= index:
+                j += 1
+            return j
+
+        def _handle_bad_samples(force_retry: bool = False):
+            if not bad_infos:
+                return None
+            self._report_bad_samples(meta, index, bad_infos)
+            if policy == "raise":
+                reason = bad_infos[0].get("reason", "bad_sample")
+                raise RuntimeError(
+                    f"[ZJUViewSynthDataset] bad sample at index={index} geom={geom_path} reason={reason}"
+                )
+            do_retry = (policy == "skip") or force_retry
+            if do_retry and _retry < self.bad_sample_max_retry:
+                next_index = _pick_next_index()
+                return self.__getitem__(next_index, _retry=_retry + 1)
+            return None
 
         # --- 读取 src ---
         src_imgs = []
         src_depths = []
         src_confs = []
         src_pointmaps = []
+        src_indices_used = []
+        src_vids_list = []
+        need_src_pad = 0
 
-        for idx in src_idxs:
+        src_pool = list(src_idxs)
+        if policy == "drop_src":
+            extra_idxs = [
+                i for i in range(V) if i not in src_idxs and i != tgt_idx]
+            if extra_idxs:
+                try:
+                    extra_idxs = list(rng.permutation(extra_idxs))
+                except Exception:
+                    extra_idxs = list(extra_idxs)
+            src_pool = list(src_idxs) + extra_idxs
+
+        for idx in src_pool:
+            if len(src_imgs) >= num_src:
+                break
             img_path = self._resolve_img_path(img_paths[idx])
-            img = Image.open(img_path).convert("RGB")
+            try:
+                img = Image.open(img_path).convert("RGB")
+            except Exception as e:
+                cam_name = cam_names[idx] if cam_names is not None else None
+                bad_infos.append({
+                    "role": "src",
+                    "view_idx": int(idx),
+                    "view_id": int(cam_ids[idx]),
+                    "cam_name": cam_name,
+                    "img_path": img_path,
+                    "stats": None,
+                    "reason": f"open_failed:{e}",
+                })
+                if policy == "drop_src":
+                    continue
+                maybe = _handle_bad_samples(force_retry=True)
+                if maybe is not None:
+                    return maybe
+                _handle_bad_samples(force_retry=True)
+                raise
             img_t = TF.to_tensor(img)  # (3,H,W) [0,1]
+            bad, stats, reasons = self._check_bad_image(img_t)
+            if bad:
+                cam_name = cam_names[idx] if cam_names is not None else None
+                bad_infos.append({
+                    "role": "src",
+                    "view_idx": int(idx),
+                    "view_id": int(cam_ids[idx]),
+                    "cam_name": cam_name,
+                    "img_path": img_path,
+                    "stats": stats,
+                    "reason": ",".join(reasons),
+                })
+                if policy == "drop_src":
+                    continue
 
             d = self._process_depth_like(depth[idx])       # (Hd,Wd)
             c = self._normalize_conf(
@@ -435,11 +600,61 @@ class ZJUViewSynthDataset(Dataset):
             src_depths.append(d_t)
             src_confs.append(c_t)
             src_pointmaps.append(pm_t)
+            src_indices_used.append(int(idx))
+            src_vids_list.append(int(cam_ids[idx]))
+
+        if len(src_imgs) < num_src:
+            bad_infos.append({
+                "role": "src",
+                "view_idx": None,
+                "view_id": None,
+                "cam_name": None,
+                "img_path": "",
+                "stats": None,
+                "reason": f"insufficient_src:{len(src_imgs)}/{num_src}",
+            })
+            maybe = _handle_bad_samples(force_retry=True)
+            if maybe is not None:
+                return maybe
+            if policy == "drop_src":
+                need_src_pad = num_src - len(src_imgs)
 
         # --- 读取 tgt ---
         tgt_img_path = self._resolve_img_path(img_paths[tgt_idx])
-        tgt_img_pil = Image.open(tgt_img_path).convert("RGB")
+        try:
+            tgt_img_pil = Image.open(tgt_img_path).convert("RGB")
+        except Exception as e:
+            cam_name = cam_names[tgt_idx] if cam_names is not None else None
+            bad_infos.append({
+                "role": "tgt",
+                "view_idx": int(tgt_idx),
+                "view_id": int(tgt_vid),
+                "cam_name": cam_name,
+                "img_path": tgt_img_path,
+                "stats": None,
+                "reason": f"open_failed:{e}",
+            })
+            maybe = _handle_bad_samples(force_retry=True)
+            if maybe is not None:
+                return maybe
+            _handle_bad_samples(force_retry=True)
+            raise
         tgt_img = TF.to_tensor(tgt_img_pil)  # (3,H,W)
+        bad, stats, reasons = self._check_bad_image(tgt_img)
+        if bad:
+            tgt_is_bad = True
+            cam_name = cam_names[tgt_idx] if cam_names is not None else None
+            bad_infos.append({
+                "role": "tgt",
+                "view_idx": int(tgt_idx),
+                "view_id": int(tgt_vid),
+                "cam_name": cam_name,
+                "img_path": tgt_img_path,
+                "stats": stats,
+                "reason": ",".join(reasons),
+            })
+            if policy == "mask":
+                bad_tgt_masked = True
         mask_path = self._infer_mask_path(tgt_img_path)
         if mask_path is None:
             raise FileNotFoundError(
@@ -454,6 +669,8 @@ class ZJUViewSynthDataset(Dataset):
         tgt_mask = torch.from_numpy(tgt_mask_np).float()
         # ensure binary {0,1} foreground mask
         tgt_fg = (tgt_mask > 0.5).float()
+        if bad_tgt_masked:
+            tgt_fg = torch.zeros_like(tgt_fg)
 
         d = self._process_depth_like(depth[tgt_idx])
         c = self._normalize_conf(self._process_depth_like(depth_conf[tgt_idx]))
@@ -468,11 +685,27 @@ class ZJUViewSynthDataset(Dataset):
         tgt_pointmap = torch.from_numpy(pm).permute(
             2, 0, 1).float()  # (3,Hd,Wd)
 
+        if need_src_pad > 0:
+            pad_vid = src_vids_list[0] if src_vids_list else int(tgt_vid)
+            pad_idx = src_indices_used[0] if src_indices_used else int(tgt_idx)
+            dummy_img = torch.zeros_like(tgt_img)
+            dummy_depth = torch.zeros_like(tgt_depth)
+            dummy_conf = torch.zeros_like(tgt_conf)
+            dummy_pm = torch.zeros_like(tgt_pointmap)
+            for _ in range(int(need_src_pad)):
+                src_imgs.append(dummy_img.clone())
+                src_depths.append(dummy_depth.clone())
+                src_confs.append(dummy_conf.clone())
+                src_pointmaps.append(dummy_pm.clone())
+                src_indices_used.append(pad_idx)
+                src_vids_list.append(pad_vid)
+
         # --- 堆叠 ---
         src_imgs = torch.stack(src_imgs, dim=0)        # (S,3,H,W)
         src_depths = torch.stack(src_depths, dim=0)      # (S,1,Hd,Wd)
         src_confs = torch.stack(src_confs, dim=0)       # (S,1,Hd,Wd)
         src_pointmaps = torch.stack(src_pointmaps, dim=0)   # (S,3,Hd,Wd)
+        src_vids = np.array(src_vids_list, dtype=np.int64)
 
         sample = {
             "src_imgs": src_imgs,
@@ -487,11 +720,13 @@ class ZJUViewSynthDataset(Dataset):
             "tgt_pointmap": tgt_pointmap,
             "tgt_vid": torch.tensor(tgt_vid, dtype=torch.long),
             "src_vids": torch.tensor(src_vids, dtype=torch.long),
+            "bad_tgt_masked": torch.tensor(
+                1 if bad_tgt_masked else 0, dtype=torch.uint8),
         }
         if self.return_cam and (extrinsic is not None) and (intrinsic is not None):
             try:
-                src_T = torch.from_numpy(extrinsic[src_idxs]).float()
-                src_K = torch.from_numpy(intrinsic[src_idxs]).float()
+                src_T = torch.from_numpy(extrinsic[src_indices_used]).float()
+                src_K = torch.from_numpy(intrinsic[src_indices_used]).float()
                 tgt_T = torch.from_numpy(extrinsic[tgt_idx]).float()
                 tgt_K = torch.from_numpy(intrinsic[tgt_idx]).float()
                 sample.update({
@@ -507,11 +742,16 @@ class ZJUViewSynthDataset(Dataset):
                 sample.update({
                     "geom_path": geom_path,
                     "tgt_img_path": tgt_img_path,
-                    "src_img_paths": [self._resolve_img_path(img_paths[i]) for i in src_idxs],
+                    "src_img_paths": [self._resolve_img_path(img_paths[i]) for i in src_indices_used],
                     "cam_names": cam_names if cam_names is not None else None,
                 })
             except Exception:
                 pass
+        if bad_infos:
+            force_retry = (policy == "drop_src" and tgt_is_bad)
+            maybe = _handle_bad_samples(force_retry=force_retry)
+            if maybe is not None:
+                return maybe
         return sample
 
 

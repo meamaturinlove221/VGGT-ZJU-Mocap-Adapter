@@ -198,7 +198,11 @@ class GeomViewDecoder(nn.Module):
         # 最终输出 RGB(3) + conf(1)
         if self.split_conf_head:
             self.out_rgb = nn.Conv2d(C, 3, kernel_size=3, padding=1)
-            self.out_conf = nn.Conv2d(C, 1, kernel_size=3, padding=1)
+            self.out_conf = nn.Sequential(
+                nn.Conv2d(C, 32, kernel_size=3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(32, 1, kernel_size=1),
+            )
         else:
             self.out_conv = nn.Conv2d(C, 4, kernel_size=3, padding=1)
         if self.use_depth_head:
@@ -225,9 +229,18 @@ class GeomViewDecoder(nn.Module):
         val = val * float(t_conf)
         with torch.no_grad():
             if self.split_conf_head:
-                if hasattr(self, "out_conf") and self.out_conf.bias is not None:
-                    if self.out_conf.bias.numel() >= 1:
-                        self.out_conf.bias[0] = val
+                conf_layer = None
+                if hasattr(self, "out_conf"):
+                    if isinstance(self.out_conf, nn.Conv2d):
+                        conf_layer = self.out_conf
+                    elif isinstance(self.out_conf, nn.Sequential):
+                        for m in reversed(self.out_conf):
+                            if isinstance(m, nn.Conv2d):
+                                conf_layer = m
+                                break
+                if conf_layer is not None and conf_layer.bias is not None:
+                    if conf_layer.bias.numel() >= 1:
+                        conf_layer.bias[0] = val
             else:
                 if hasattr(self, "out_conv") and self.out_conv.bias is not None:
                     if self.out_conv.bias.numel() >= 4:
@@ -398,6 +411,7 @@ class GeomViewDecoder(nn.Module):
         t_conf = self.conf_sigmoid_temp if self.conf_sigmoid_temp > 0 else 1.0
         rgb = torch.sigmoid(rgb_logits / t_rgb)         # (B,3,H,W)
         conf_out = torch.sigmoid(conf_logits / t_conf)  # (B,1,H,W)
+        conf_out = conf_out.clamp(1e-4, 1.0 - 1e-4)
 
         rgb = self._apply_view_affine(rgb, tgt_vid, src_vids)
 

@@ -216,6 +216,11 @@ class Cfg:
     conf_use_quantile: bool
     conf_qlo: float
     conf_qhi: float
+    bad_sample_policy: str
+    white_mean_thr: float
+    white_std_thr: float
+    bad_sample_max_retry: int
+    report_bad_samples: bool
 
     amp: bool
     tf32: bool
@@ -281,6 +286,11 @@ class Cfg:
             conf_use_quantile=_env_bool("VGGT_CONF_USE_QUANTILE", True),
             conf_qlo=_env_float("VGGT_CONF_QLO", 0.05),
             conf_qhi=_env_float("VGGT_CONF_QHI", 0.95),
+            bad_sample_policy=_env("VGGT_BAD_SAMPLE_POLICY", "warn"),
+            white_mean_thr=_env_float("VGGT_WHITE_MEAN_THR", 0.98),
+            white_std_thr=_env_float("VGGT_WHITE_STD_THR", 1e-3),
+            bad_sample_max_retry=_env_int("VGGT_BAD_SAMPLE_MAX_RETRY", 3),
+            report_bad_samples=_env_bool("VGGT_REPORT_BAD_SAMPLES", True),
             amp=_env_bool("VGGT_AMP", True),
             tf32=_env_bool("VGGT_TF32", True),
             debug_train_every=_env_int("VGGT_DEBUG_TRAIN_EVERY", 200),
@@ -464,6 +474,10 @@ def _build_train_cmd(cfg: Cfg) -> list[str]:
         "--recon_weight_clip_max", str(cfg.recon_weight_clip_max),
         "--conf_qlo", str(cfg.conf_qlo),
         "--conf_qhi", str(cfg.conf_qhi),
+        "--bad_sample_policy", cfg.bad_sample_policy,
+        "--white_mean_thr", str(cfg.white_mean_thr),
+        "--white_std_thr", str(cfg.white_std_thr),
+        "--bad_sample_max_retry", str(cfg.bad_sample_max_retry),
         "--debug_train_every", str(cfg.debug_train_every),
         "--debug_val_every_epoch", str(cfg.debug_val_every_epoch),
         "--log_dir", log_dir,
@@ -488,6 +502,11 @@ def _build_train_cmd(cfg: Cfg) -> list[str]:
         cmd.append("--conf_use_quantile")
     else:
         cmd.append("--no_conf_use_quantile")
+
+    if cfg.report_bad_samples:
+        cmd.append("--report_bad_samples")
+    else:
+        cmd.append("--no_report_bad_samples")
 
     if cfg.amp:
         cmd.append("--amp")
@@ -584,11 +603,23 @@ def run_remote(cfg_json: str):
 
 
 @app.local_entrypoint()
-def main():
+def main(
+    bad_sample_policy: str = CFG_IMPORT.bad_sample_policy,
+    white_mean_thr: float = CFG_IMPORT.white_mean_thr,
+    white_std_thr: float = CFG_IMPORT.white_std_thr,
+    bad_sample_max_retry: int = CFG_IMPORT.bad_sample_max_retry,
+    report_bad_samples: bool = CFG_IMPORT.report_bad_samples,
+):
     cfg = Cfg.from_env()
     if not cfg.seq_names:
         raise SystemExit(
             "VGGT_SEQ/VGGT_SEQ_NAMES is empty; set at least one seq like CoreView_390")
+
+    cfg.bad_sample_policy = bad_sample_policy
+    cfg.white_mean_thr = white_mean_thr
+    cfg.white_std_thr = white_std_thr
+    cfg.bad_sample_max_retry = bad_sample_max_retry
+    cfg.report_bad_samples = report_bad_samples
 
     # Print minimal sanity based on your volume screenshots
     print("[local] NOTE: dataset layout (from your screenshots) is:")
