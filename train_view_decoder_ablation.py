@@ -2201,6 +2201,20 @@ def parse_args():
                    help="Split frames by random shuffle or contiguous tail for val.")
     p.add_argument("--frame_subsample", type=int, default=1)
     p.add_argument("--num_src_views", type=int, default=3)
+    p.add_argument("--view_select_mode", type=str, default="uniform_yaw",
+                   choices=["random", "uniform_yaw"],
+                   help="How to pick source views for each sample.")
+    p.add_argument("--yaw_jitter_deg", type=float, default=20.0,
+                   help="Per-bin yaw jitter when view_select_mode=uniform_yaw.")
+    p.add_argument("--yaw_phase_jitter_deg", type=float, default=20.0,
+                   help="Global phase jitter when view_select_mode=uniform_yaw.")
+    p.add_argument("--yaw_axis_x", type=int, default=0,
+                   help="World axis index used as yaw x component.")
+    p.add_argument("--yaw_axis_z", type=int, default=2,
+                   help="World axis index used as yaw z component.")
+    p.add_argument("--yaw_center_mode", type=str, default="pointmap",
+                   choices=["pointmap", "camera"],
+                   help="Center estimator for yaw computation.")
     p.add_argument("--holdout_view_ids", type=str, default="",
                    help="Comma-separated camera IDs to hold out (val-only targets).")
     p.add_argument("--holdout_view_names", type=str, default="",
@@ -2469,6 +2483,18 @@ def parse_args():
     p.add_argument("--debug_train_every", type=int, default=200)
     p.add_argument("--nan_check_every", type=int, default=200,
                    help="Check NaN/Inf on key tensors every N steps")
+    p.add_argument("--mosaic_every_steps", type=int, default=0,
+                   help="If >0, render inspect_batch_mosaic every N optimizer steps.")
+    p.add_argument("--mosaic_num_targets", type=int, default=3,
+                   help="How many target views per auto-mosaic.")
+    p.add_argument("--mosaic_num_src_views", type=int, default=6,
+                   help="How many source views shown per target in auto-mosaic.")
+    p.add_argument("--mosaic_tile_size", type=int, default=300,
+                   help="Tile size in pixels for auto-mosaic.")
+    p.add_argument("--mosaic_point_stride", type=int, default=24,
+                   help="Point stride for reprojection overlay in auto-mosaic.")
+    p.add_argument("--mosaic_seed", type=int, default=2026,
+                   help="RNG seed for auto-mosaic target/view sampling.")
     p.add_argument("--debug_val_every_epoch",
                    action="store_true", default=True)
     p.add_argument("--debug_fixed_batch", action="store_true", default=True,
@@ -2621,6 +2647,17 @@ def main():
         "train_mask_mode": args.train_mask_mode,
         "recon_mask_mode": args.recon_mask_mode,
         "split_mode": args.split_mode,
+        "view_select_mode": args.view_select_mode,
+        "yaw_jitter_deg": args.yaw_jitter_deg,
+        "yaw_phase_jitter_deg": args.yaw_phase_jitter_deg,
+        "yaw_axis_x": args.yaw_axis_x,
+        "yaw_axis_z": args.yaw_axis_z,
+        "yaw_center_mode": args.yaw_center_mode,
+        "mosaic_every_steps": args.mosaic_every_steps,
+        "mosaic_num_targets": args.mosaic_num_targets,
+        "mosaic_num_src_views": args.mosaic_num_src_views,
+        "mosaic_tile_size": args.mosaic_tile_size,
+        "mosaic_point_stride": args.mosaic_point_stride,
         "holdout_view_ids": ",".join(str(v) for v in holdout_view_ids),
         "holdout_view_names": ",".join(holdout_view_names),
         "fg_drop_ground": args.fg_drop_ground,
@@ -2650,12 +2687,20 @@ def main():
     # ---------------------------
     # Dataset
     # ---------------------------
+    need_geom_path = bool(int(args.mosaic_every_steps) > 0)
     base_ds = ZJUViewSynthDataset(
         root=args.zju_root,
         seq_names=seq_names,
         num_src_views=args.num_src_views,
         frame_subsample=args.frame_subsample,
+        view_select_mode=args.view_select_mode,
+        yaw_jitter_deg=args.yaw_jitter_deg,
+        yaw_phase_jitter_deg=args.yaw_phase_jitter_deg,
+        yaw_axis_x=args.yaw_axis_x,
+        yaw_axis_z=args.yaw_axis_z,
+        yaw_center_mode=args.yaw_center_mode,
         split=None,
+        return_paths=need_geom_path,
         bad_sample_policy=args.bad_sample_policy,
         white_mean_thr=args.white_mean_thr,
         white_std_thr=args.white_std_thr,
@@ -2671,9 +2716,16 @@ def main():
         train_ratio=args.train_ratio,
         split_seed=args.split_seed,
         split_mode=args.split_mode,
+        view_select_mode=args.view_select_mode,
+        yaw_jitter_deg=args.yaw_jitter_deg,
+        yaw_phase_jitter_deg=args.yaw_phase_jitter_deg,
+        yaw_axis_x=args.yaw_axis_x,
+        yaw_axis_z=args.yaw_axis_z,
+        yaw_center_mode=args.yaw_center_mode,
         tgt_view_ids_exclude=(holdout_view_ids if holdout_view_ids else None),
         tgt_view_names_exclude=(holdout_view_names if holdout_view_names else None),
         deterministic_views=False,
+        return_paths=need_geom_path,
         bad_sample_policy=args.bad_sample_policy,
         white_mean_thr=args.white_mean_thr,
         white_std_thr=args.white_std_thr,
@@ -2689,9 +2741,16 @@ def main():
         train_ratio=args.train_ratio,
         split_seed=args.split_seed,
         split_mode=args.split_mode,
+        view_select_mode=args.view_select_mode,
+        yaw_jitter_deg=args.yaw_jitter_deg,
+        yaw_phase_jitter_deg=args.yaw_phase_jitter_deg,
+        yaw_axis_x=args.yaw_axis_x,
+        yaw_axis_z=args.yaw_axis_z,
+        yaw_center_mode=args.yaw_center_mode,
         tgt_view_ids=(holdout_view_ids if holdout_view_ids else None),
         tgt_view_names=(holdout_view_names if holdout_view_names else None),
         deterministic_views=True,
+        return_paths=need_geom_path,
         bad_sample_policy=args.bad_sample_policy,
         white_mean_thr=args.white_mean_thr,
         white_std_thr=args.white_std_thr,
@@ -3414,6 +3473,70 @@ def main():
         model.train(was_training)
         return pred_rgb_dbg, tgt_img_dbg, aux_dbg
 
+    mosaic_rng = np.random.RandomState(int(args.mosaic_seed))
+    _mosaic_render_fn = None
+    _mosaic_warned_no_geom = False
+    _mosaic_warned_fail = False
+
+    def _batch_geom_paths(b: Dict[str, Any]) -> List[str]:
+        geom = b.get("geom_path", None)
+        if geom is None:
+            return []
+        if isinstance(geom, np.ndarray):
+            vals = geom.tolist()
+            if isinstance(vals, list):
+                return [str(x) for x in vals]
+            return [str(vals)]
+        if isinstance(geom, (list, tuple)):
+            return [str(x) for x in geom]
+        return [str(geom)]
+
+    def _maybe_save_auto_mosaic(step_i: int, b: Dict[str, Any]):
+        nonlocal _mosaic_render_fn, _mosaic_warned_no_geom, _mosaic_warned_fail
+        every = int(args.mosaic_every_steps)
+        if every <= 0:
+            return
+        if (int(step_i) % every) != 0:
+            return
+
+        geom_paths = [p for p in _batch_geom_paths(b) if p and p.lower() != "none"]
+        if not geom_paths:
+            if not _mosaic_warned_no_geom:
+                print("[mosaic] [warn] batch missing geom_path; auto-mosaic disabled for this run.")
+                _mosaic_warned_no_geom = True
+            return
+
+        bidx = int(mosaic_rng.randint(0, len(geom_paths)))
+        geom_path = str(geom_paths[bidx])
+        out_dir = os.path.join(args.log_dir, "mosaic")
+        base = os.path.splitext(os.path.basename(geom_path))[0]
+        out_path = os.path.join(out_dir, f"train_step{int(step_i):06d}_b{bidx:02d}_{base}.png")
+
+        try:
+            if _mosaic_render_fn is None:
+                from inspect_batch_mosaic import render_mosaic_from_npz as _render
+                _mosaic_render_fn = _render
+            _mosaic_render_fn(
+                npz_path=geom_path,
+                zju_root=args.zju_root,
+                seq_names=seq_names,
+                out_path=out_path,
+                num_targets=int(args.mosaic_num_targets),
+                num_src_views=int(args.mosaic_num_src_views),
+                yaw_jitter_deg=float(args.yaw_jitter_deg),
+                yaw_phase_jitter_deg=float(args.yaw_phase_jitter_deg),
+                yaw_axis_x=int(args.yaw_axis_x),
+                yaw_axis_z=int(args.yaw_axis_z),
+                tile_size=int(args.mosaic_tile_size),
+                point_stride=int(args.mosaic_point_stride),
+                rng=mosaic_rng,
+            )
+            print(f"[mosaic] saved: {out_path}")
+        except Exception as e:
+            if not _mosaic_warned_fail:
+                print(f"[mosaic] [warn] failed to render mosaic: {e}")
+                _mosaic_warned_fail = True
+
     for epoch in range(start_epoch, args.epochs):
         model.train()
         epoch_loss = 0.0
@@ -3820,6 +3943,7 @@ def main():
                     scheduler.step()
 
                 global_step += 1
+                _maybe_save_auto_mosaic(global_step, batch)
 
                 if args.use_ema and ema_model is not None:
                     if (not ema_started) and (global_step >= ema_start_step):

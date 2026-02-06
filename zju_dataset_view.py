@@ -9,6 +9,7 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset
 import torchvision.transforms.functional as TF
+from select_views_uniform_yaw import select_src_tgt_uniform_yaw
 
 
 class ZJUViewSynthDataset(Dataset):
@@ -24,6 +25,12 @@ class ZJUViewSynthDataset(Dataset):
         split_mode="random",
         deterministic_views=False,  # True 时每个样本固定 src/tgt 选法（val/test 建议 True）
         view_seed=2025,
+        view_select_mode: str = "random",  # random / uniform_yaw
+        yaw_jitter_deg: float = 20.0,
+        yaw_phase_jitter_deg: float = 20.0,
+        yaw_axis_x: int = 0,
+        yaw_axis_z: int = 2,
+        yaw_center_mode: str = "pointmap",  # pointmap / camera
         tgt_view_ids=None,
         tgt_view_names=None,
         tgt_view_ids_exclude=None,
@@ -55,6 +62,18 @@ class ZJUViewSynthDataset(Dataset):
 
         self.deterministic_views = bool(deterministic_views)
         self.view_seed = int(view_seed)
+        self.view_select_mode = str(
+            view_select_mode or "random").lower().strip().replace("-", "_")
+        if self.view_select_mode not in ("random", "uniform_yaw"):
+            self.view_select_mode = "random"
+        self.yaw_jitter_deg = float(yaw_jitter_deg)
+        self.yaw_phase_jitter_deg = float(yaw_phase_jitter_deg)
+        self.yaw_axis_x = int(yaw_axis_x)
+        self.yaw_axis_z = int(yaw_axis_z)
+        self.yaw_center_mode = str(yaw_center_mode or "pointmap").lower().strip()
+        if self.yaw_center_mode not in ("pointmap", "camera"):
+            self.yaw_center_mode = "pointmap"
+        self._warned_uniform_yaw_fallback = False
         self.num_views = 0
         self.num_views_by_seq = {}
         self.cam_name_to_id = {}
@@ -221,6 +240,10 @@ class ZJUViewSynthDataset(Dataset):
 
         # 统一分隔符（Linux 下反斜杠会被当作普通字符）
         s = s.replace("\\", "/")
+
+        # 0) Relative path that already exists from current working directory.
+        if osp.exists(s):
+            return s
 
         # 1) Linux/Posix 绝对路径：直接用
         if osp.isabs(s):
@@ -465,11 +488,14 @@ class ZJUViewSynthDataset(Dataset):
         else:
             rng = np.random
 
-        if (self.tgt_view_ids is None) and (self.tgt_view_ids_exclude is None):
-            perm = rng.permutation(cam_ids)
-            src_idxs = perm[:num_src]
-            tgt_idx = perm[num_src]
-        else:
+        def _select_random_src_tgt():
+            all_idxs = np.arange(V, dtype=np.int64)
+            if (self.tgt_view_ids is None) and (self.tgt_view_ids_exclude is None):
+                perm = rng.permutation(all_idxs)
+                src_i = perm[:num_src]
+                tgt_i = int(perm[num_src])
+                return np.asarray(src_i, dtype=np.int64), int(tgt_i)
+
             eligible = []
             for i in range(V):
                 vid = int(cam_ids[i])
@@ -483,14 +509,52 @@ class ZJUViewSynthDataset(Dataset):
                     f"[ZJUViewSynthDataset] no eligible tgt views after holdout filter in {geom_path}"
                 )
             if len(eligible) == 1:
-                tgt_idx = eligible[0]
+                tgt_i = int(eligible[0])
             else:
-                tgt_idx = int(rng.choice(eligible))
-            remaining = [i for i in range(V) if i != tgt_idx]
-            if len(remaining) < num_src:
-                num_src = len(remaining)
+                tgt_i = int(rng.choice(eligible))
+            remaining = [i for i in range(V) if i != tgt_i]
+            num_src_eff = min(num_src, len(remaining))
             perm = rng.permutation(remaining)
-            src_idxs = perm[:num_src]
+            src_i = perm[:num_src_eff]
+            return np.asarray(src_i, dtype=np.int64), int(tgt_i)
+
+        src_idxs = None
+        tgt_idx = None
+        if self.view_select_mode == "uniform_yaw" and (extrinsic is not None):
+            try:
+                src_idxs, tgt_idx, _ = select_src_tgt_uniform_yaw(
+                    cam_ids=cam_ids,
+                    extrinsic=extrinsic,
+                    pointmap=(pointmap if self.yaw_center_mode == "pointmap" else None),
+                    num_src_views=num_src,
+                    rng=rng,
+                    tgt_view_ids=self.tgt_view_ids,
+                    tgt_view_ids_exclude=self.tgt_view_ids_exclude,
+                    yaw_jitter_deg=self.yaw_jitter_deg,
+                    yaw_phase_jitter_deg=self.yaw_phase_jitter_deg,
+                    yaw_axis_x=self.yaw_axis_x,
+                    yaw_axis_z=self.yaw_axis_z,
+                    center_mode=self.yaw_center_mode,
+                )
+            except Exception as e:
+                if not self._warned_uniform_yaw_fallback:
+                    print(
+                        "[ZJUViewSynthDataset] [warn] uniform_yaw select failed; "
+                        f"fallback to random. reason={e}"
+                    )
+                    self._warned_uniform_yaw_fallback = True
+        elif self.view_select_mode == "uniform_yaw" and (extrinsic is None):
+            if not self._warned_uniform_yaw_fallback:
+                print(
+                    "[ZJUViewSynthDataset] [warn] uniform_yaw requires extrinsic; "
+                    "fallback to random."
+                )
+                self._warned_uniform_yaw_fallback = True
+
+        if src_idxs is None or tgt_idx is None:
+            src_idxs, tgt_idx = _select_random_src_tgt()
+
+        num_src = int(len(src_idxs))
 
         tgt_vid = cam_ids[tgt_idx]
 
@@ -771,6 +835,12 @@ def _dump_one_batch_from_args(args):
         split_mode=str(args.split_mode),
         deterministic_views=bool(args.deterministic_views),
         view_seed=int(args.view_seed),
+        view_select_mode=str(args.view_select_mode),
+        yaw_jitter_deg=float(args.yaw_jitter_deg),
+        yaw_phase_jitter_deg=float(args.yaw_phase_jitter_deg),
+        yaw_axis_x=int(args.yaw_axis_x),
+        yaw_axis_z=int(args.yaw_axis_z),
+        yaw_center_mode=str(args.yaw_center_mode),
         tgt_view_ids=args.tgt_view_ids,
         tgt_view_names=args.tgt_view_names,
         tgt_view_ids_exclude=args.tgt_view_ids_exclude,
@@ -820,6 +890,14 @@ def _build_dump_parser():
     ap.add_argument("--split_mode", type=str, default="random")
     ap.add_argument("--deterministic_views", action="store_true", default=True)
     ap.add_argument("--view_seed", type=int, default=2025)
+    ap.add_argument("--view_select_mode", type=str, default="random",
+                    choices=["random", "uniform_yaw"])
+    ap.add_argument("--yaw_jitter_deg", type=float, default=20.0)
+    ap.add_argument("--yaw_phase_jitter_deg", type=float, default=20.0)
+    ap.add_argument("--yaw_axis_x", type=int, default=0)
+    ap.add_argument("--yaw_axis_z", type=int, default=2)
+    ap.add_argument("--yaw_center_mode", type=str, default="pointmap",
+                    choices=["pointmap", "camera"])
     ap.add_argument("--tgt_view_ids", type=str, default=None)
     ap.add_argument("--tgt_view_names", type=str, default=None)
     ap.add_argument("--tgt_view_ids_exclude", type=str, default=None)

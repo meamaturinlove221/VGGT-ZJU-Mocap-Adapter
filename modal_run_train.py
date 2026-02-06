@@ -170,6 +170,18 @@ class Cfg:
     best_by: str = "ema"
     use_view_cond: bool = False
     view_cond_mode: str = "tgt"
+    view_select_mode: str = "uniform_yaw"
+    yaw_jitter_deg: float = 20.0
+    yaw_phase_jitter_deg: float = 20.0
+    yaw_axis_x: int = 0
+    yaw_axis_z: int = 2
+    yaw_center_mode: str = "pointmap"
+    mosaic_every_steps: int = 200
+    mosaic_num_targets: int = 3
+    mosaic_num_src_views: int = 6
+    mosaic_tile_size: int = 300
+    mosaic_point_stride: int = 24
+    mosaic_seed: int = 2026
     tf32: bool = True
     amp: bool = True
 
@@ -232,6 +244,18 @@ class Cfg:
             best_by=_env("VGGT_BEST_BY", "ema"),
             use_view_cond=_env_bool("VGGT_USE_VIEW_COND", False),
             view_cond_mode=_env("VGGT_VIEW_COND_MODE", "tgt"),
+            view_select_mode=_env("VGGT_VIEW_SELECT_MODE", "uniform_yaw"),
+            yaw_jitter_deg=_env_float("VGGT_YAW_JITTER_DEG", 20.0),
+            yaw_phase_jitter_deg=_env_float("VGGT_YAW_PHASE_JITTER_DEG", 20.0),
+            yaw_axis_x=_env_int("VGGT_YAW_AXIS_X", 0),
+            yaw_axis_z=_env_int("VGGT_YAW_AXIS_Z", 2),
+            yaw_center_mode=_env("VGGT_YAW_CENTER_MODE", "pointmap"),
+            mosaic_every_steps=_env_int("VGGT_MOSAIC_EVERY_STEPS", 200),
+            mosaic_num_targets=_env_int("VGGT_MOSAIC_NUM_TARGETS", 3),
+            mosaic_num_src_views=_env_int("VGGT_MOSAIC_NUM_SRC_VIEWS", 6),
+            mosaic_tile_size=_env_int("VGGT_MOSAIC_TILE_SIZE", 300),
+            mosaic_point_stride=_env_int("VGGT_MOSAIC_POINT_STRIDE", 24),
+            mosaic_seed=_env_int("VGGT_MOSAIC_SEED", 2026),
             tf32=_env_bool("VGGT_TF32", True),
             amp=_env_bool("VGGT_AMP", True),
             # volumes
@@ -448,6 +472,23 @@ def _build_train_cmd(cfg: Cfg) -> list[str]:
     else:
         args.append("--no_debug_fixed_batch")
     args.append(f"--debug_fixed_index={cfg.debug_fixed_index}")
+
+    script_name = Path(cfg.train_script).name.lower()
+    if "train_view_decoder_ablation" in script_name:
+        args.extend([
+            f"--view_select_mode={cfg.view_select_mode}",
+            f"--yaw_jitter_deg={cfg.yaw_jitter_deg}",
+            f"--yaw_phase_jitter_deg={cfg.yaw_phase_jitter_deg}",
+            f"--yaw_axis_x={int(cfg.yaw_axis_x)}",
+            f"--yaw_axis_z={int(cfg.yaw_axis_z)}",
+            f"--yaw_center_mode={cfg.yaw_center_mode}",
+            f"--mosaic_every_steps={int(cfg.mosaic_every_steps)}",
+            f"--mosaic_num_targets={int(cfg.mosaic_num_targets)}",
+            f"--mosaic_num_src_views={int(cfg.mosaic_num_src_views)}",
+            f"--mosaic_tile_size={int(cfg.mosaic_tile_size)}",
+            f"--mosaic_point_stride={int(cfg.mosaic_point_stride)}",
+            f"--mosaic_seed={int(cfg.mosaic_seed)}",
+        ])
 
     # Extra user-provided args
     if cfg.train_args_extra.strip():
