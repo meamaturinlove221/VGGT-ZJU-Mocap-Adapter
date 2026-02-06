@@ -1,68 +1,83 @@
-# F:\vggt\precompute_zju_vggt_geom.py
-
 import os
 import os.path as osp
+
 import numpy as np
+import torch
 from tqdm import tqdm
 
-import torch
-
-from zju_multiview import ZJUMocapSeq
 from vggt_geom import VGGTGeomTeacher
+from zju_multiview import ZJUMocapSeq
 
 
 def to_numpy(x):
-    """兼容 torch.Tensor 和 numpy.ndarray，统一转成 numpy."""
     if isinstance(x, torch.Tensor):
         return x.detach().cpu().numpy()
-    else:
-        # 比如已经是 numpy，或者 list 之类
-        return np.asarray(x)
+    return np.asarray(x)
 
 
-# 1) ZJU-MoCap 根目录（照你现在的结构）
 ZJU_ROOT = r"F:\datasets\ZJU_MoCap\data\zju_mocap"
-
-# 2) 先挑几个 sequence 做实验，确认没问题再加
 SEQ_LIST = [
     "CoreView_390",
     # "CoreView_313",
     # "CoreView_377",
 ]
-
-# 3) 可选：限定使用哪些 Camera_*（不写就是全部）
 SELECT_CAMERAS = [
     "Camera_B1",
     "Camera_B5",
-    "Camera_B9",
-    "Camera_B13",
+    "Camera_B10",
+    "Camera_B14",
+    "Camera_B19",
+    "Camera_B23",
 ]
-
-# 4) VGGT 权重
 CKPT_PATH = r"F:\vggt\model.pt"
 
 
-def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    teacher = VGGTGeomTeacher(CKPT_PATH, device=device)
+def _split_list(raw: str) -> list[str]:
+    raw = (raw or "").replace(",", " ").replace(";", " ").replace("|", " ")
+    return [x for x in raw.split() if x]
 
-    for seq_name in SEQ_LIST:
-        seq_root = osp.join(ZJU_ROOT, seq_name)
+
+def main():
+    # _ENV_VARS_VGGT_
+    zju_root = os.environ.get("VGGT_ZJU_ROOT", "").strip() or ZJU_ROOT
+    ckpt_path = os.environ.get("VGGT_CKPT", "").strip() or CKPT_PATH
+    out_dir = os.environ.get("VGGT_OUT_DIR", "").strip() or "vggt_geom"
+
+    seq_list = _split_list(os.environ.get("VGGT_SEQ_NAMES", "").strip()) or list(SEQ_LIST)
+    cam_list = _split_list(os.environ.get("VGGT_CAM_NAMES", "").strip()) or list(SELECT_CAMERAS)
+
+    max_raw = os.environ.get("VGGT_MAX_FRAMES", "").strip()
+    max_frames = int(max_raw) if max_raw.isdigit() else 0
+
+    device_env = os.environ.get("VGGT_DEVICE", "").strip().lower()
+    if device_env in {"", "auto", "none"}:
+        device_env = ""
+    use_cuda = torch.cuda.is_available() and (torch.cuda.device_count() > 0)
+    device = device_env or ("cuda" if use_cuda else "cpu")
+    if str(device).startswith("cuda") and torch.cuda.device_count() == 0:
+        device = "cpu"
+
+    print("[dev]", "resolved_device=", device, "cuda_count=", torch.cuda.device_count())
+    teacher = VGGTGeomTeacher(ckpt_path, device=device)
+
+    for seq_name in seq_list:
+        seq_root = osp.join(zju_root, seq_name)
         if not osp.isdir(seq_root):
             print("[warn] seq not found:", seq_root)
             continue
 
-        # 输出目录：直接放在 CoreView_xxx/vggt_geom
-        out_root = osp.join(seq_root, "vggt_geom")
+        out_root = osp.join(seq_root, out_dir)
         os.makedirs(out_root, exist_ok=True)
 
-        # 构建 sequence 读帧
-        seq = ZJUMocapSeq(seq_root, cam_names=SELECT_CAMERAS)
-
+        seq = ZJUMocapSeq(seq_root, cam_names=(cam_list if len(cam_list) > 0 else None))
         print(f"[{seq_name}] frames={seq.num_frames()} cams={seq.num_cams()}")
 
-        for frame_idx in tqdm(range(seq.num_frames()), desc=seq_name):
-            fid = seq.get_frame_id(frame_idx)  # 比如 0,1,2,...
+        num_frames = seq.num_frames()
+        if max_frames > 0:
+            num_frames = min(num_frames, int(max_frames))
+
+        for frame_idx in tqdm(range(num_frames), desc=seq_name):
+            fid = seq.get_frame_id(frame_idx)
             out_npz = osp.join(out_root, f"frame_{fid:06d}.npz")
             if osp.exists(out_npz):
                 continue
@@ -72,22 +87,42 @@ def main():
                 continue
 
             cam_names = sorted(cam2path.keys())
-            img_paths = [osp.relpath(cam2path[c], start=ZJU_ROOT).replace(
-                "\\", "/") for c in cam_names]
+            img_paths = [osp.relpath(cam2path[c], start=zju_root).replace("\\", "/") for c in cam_names]
 
             with torch.no_grad():
+                # Resolve relative image paths to absolute paths for teacher inference.
+                img_paths2 = []
+                for p in img_paths:
+                    s = str(p)
+                    if osp.exists(s):
+                        img_paths2.append(s)
+                        continue
+
+                    s2 = s.replace("\\", "/")
+                    if len(s2) >= 3 and s2[1] == ":" and s2[2] == "/":
+                        s2 = s2[2:]
+                    ix = s2.find("CoreView_")
+                    if ix != -1:
+                        s2 = s2[ix:]
+                    s2 = s2.lstrip("/")
+                    if s2.startswith("CoreView_"):
+                        cand = osp.join(zju_root, s2)
+                    else:
+                        cand = osp.join(seq_root, s2)
+                    img_paths2.append(cand)
+                img_paths = img_paths2
+
                 geom = teacher(img_paths)
 
-            # 存 numpy
             np.savez_compressed(
                 out_npz,
                 cam_names=np.array(cam_names),
                 img_paths=np.array(img_paths),
-                depth=to_numpy(geom["depth"]),           # (V,H,W)
-                depth_conf=to_numpy(geom["depth_conf"]),  # (V,H,W)
-                pointmap=to_numpy(geom["pointmap"]),     # (V,H,W,3)
-                extrinsic=to_numpy(geom["extrinsic"]),   # (V,4,4)
-                intrinsic=to_numpy(geom["intrinsic"]),   # (V,3,3)
+                depth=to_numpy(geom["depth"]),
+                depth_conf=to_numpy(geom["depth_conf"]),
+                pointmap=to_numpy(geom["pointmap"]),
+                extrinsic=to_numpy(geom["extrinsic"]),
+                intrinsic=to_numpy(geom["intrinsic"]),
             )
 
         print(f"[{seq_name}] done, saved to {out_root}")

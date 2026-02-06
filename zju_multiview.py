@@ -101,8 +101,8 @@ class ZJUMocapSeq:
     def get_frame_paths(self, frame_idx: int) -> Dict[str, str]:
         """
         给定 frame_idx（0 ~ num_frames-1）返回这一帧的所有视角：
-            { "Camera_B1": "...\Camera_B1\000000.jpg",
-              "Camera_B2": "...\Camera_B2\000000.jpg",
+            { "Camera_B1": ".../Camera_B1/000000.jpg",
+              "Camera_B2": ".../Camera_B2/000000.jpg",
               ... }
         没有该帧的相机会自动跳过。
         """

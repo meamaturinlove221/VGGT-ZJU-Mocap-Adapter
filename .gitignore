@@ -153,3 +153,9 @@ debug_viewdec_ablation/
 model.pt
 *.pt
 models/*
+
+# Local backup artifacts (never commit)
+*.bak
+*.bak_*
+*.bak-*
+*.bak.*
