@@ -1,5 +1,6 @@
 import os
 import os.path as osp
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -29,7 +30,7 @@ SELECT_CAMERAS = [
     "Camera_B19",
     "Camera_B23",
 ]
-CKPT_PATH = r"F:\vggt\model.pt"
+CKPT_PATH = "model.pt"
 
 
 def _split_list(raw: str) -> list[str]:
@@ -37,10 +38,27 @@ def _split_list(raw: str) -> list[str]:
     return [x for x in raw.split() if x]
 
 
+def _resolve_ckpt_path() -> str:
+    # Prefer explicit envs from Modal launcher.
+    env_ckpt = os.environ.get("VGGT_CKPT", "").strip()
+    if not env_ckpt:
+        env_ckpt = os.environ.get("VGGT_PRECOMPUTE_CKPT", "").strip()
+    if env_ckpt:
+        return env_ckpt
+
+    # Portable default: model.pt next to this script.
+    local_default = Path(__file__).resolve().with_name("model.pt")
+    if local_default.exists():
+        return str(local_default)
+
+    # Final fallback for legacy local runs.
+    return CKPT_PATH
+
+
 def main():
     # _ENV_VARS_VGGT_
     zju_root = os.environ.get("VGGT_ZJU_ROOT", "").strip() or ZJU_ROOT
-    ckpt_path = os.environ.get("VGGT_CKPT", "").strip() or CKPT_PATH
+    ckpt_path = _resolve_ckpt_path()
     out_dir = os.environ.get("VGGT_OUT_DIR", "").strip() or "vggt_geom"
 
     seq_list = _split_list(os.environ.get("VGGT_SEQ_NAMES", "").strip()) or list(SEQ_LIST)

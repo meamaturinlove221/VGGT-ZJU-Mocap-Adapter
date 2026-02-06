@@ -3,598 +3,628 @@ import sys
 import json
 import time
 import shlex
-import shutil
-import inspect
 import subprocess
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 
 import modal
 
 # --------------------------
-# Constants (container paths)
-# --------------------------
-MNT_DATA = "/mnt/data"   # data volume mount
-MNT_OUT = "/mnt/out"    # output volume mount
-MNT_CODE = "/mnt/code"   # mounted repo code
-
-DEFAULT_DATA_VOL = "vggt-zju-data"
-DEFAULT_OUT_VOL = "vggt-out"
-
-# Your screenshots show:
-#   vggt-zju-data / zju_mocap / CoreView_390 / ...
-DEFAULT_ZJU_ROOT = f"{MNT_DATA}/zju_mocap"
-DEFAULT_ARCHIVES = f"{MNT_DATA}/archives"
-
-
-# --------------------------
 # Env helpers
 # --------------------------
-def _env(key: str, default: str) -> str:
+
+
+def _env(key: str, default: str | None = None) -> str:
     v = os.environ.get(key)
-    return default if v is None else v
+    if v is None:
+        return "" if default is None else default
+    return v
 
 
 def _env_int(key: str, default: int) -> int:
-    v = os.environ.get(key)
-    if v is None or str(v).strip() == "":
+    s = _env(key, str(default)).strip()
+    try:
+        return int(s)
+    except Exception:
         return default
-    return int(v)
 
 
 def _env_float(key: str, default: float) -> float:
-    v = os.environ.get(key)
-    if v is None or str(v).strip() == "":
+    s = _env(key, str(default)).strip()
+    try:
+        return float(s)
+    except Exception:
         return default
-    return float(v)
 
 
 def _env_bool(key: str, default: bool) -> bool:
-    v = os.environ.get(key)
-    if v is None or str(v).strip() == "":
-        return default
-    s = str(v).strip().lower()
-    return s in ("1", "true", "yes", "y", "on")
+    s = _env(key, str(default)).strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off"):
+        return False
+    return default
 
 
 def _split_seq_names(s: str) -> list[str]:
     s = (s or "").strip()
     if not s:
         return []
-    # allow comma/space separated
-    parts = []
+    parts = [p.strip() for p in s.replace(",", " ").split() if p.strip()]
+    return parts
+
+
+def _split_csv_list(s: str) -> list[str]:
+    """Split env var like 'a,b c' into ['a','b','c'] (comma/space supported)."""
+    s = (s or "").strip()
+    if not s:
+        return []
+    parts: list[str] = []
     for chunk in s.replace(",", " ").split():
         if chunk.strip():
             parts.append(chunk.strip())
     return parts
 
 
-# --------------------------
-# GPU parsing (robust alias)
-# --------------------------
-def _make_gpu_from_spec(spec: str):
-    spec0 = (spec or "").strip()
-    if not spec0:
-        return None
-    s = spec0.strip().lower().replace("_", "-")
+def _sanitize_env_path(value: str, key: str) -> str:
+    """
+    Sanitize path-like env values.
+    This guards against accidental control characters introduced by nested
+    Python string parsing (e.g. '\\v' becoming VT 0x0b).
+    """
+    s = (value or "").strip()
+    if not s:
+        return s
 
-    if s in ("none", "cpu", "0"):
-        return None
+    if not any(ord(ch) < 32 for ch in s):
+        return s
 
-    # normalize common aliases
-    alias = {
-        "a100-80g": "a100-80gb",
-        "a100-80": "a100-80gb",
-        "a100-80gb": "a100-80gb",
-        "a100-40g": "a100-40gb",
-        "a100-40": "a100-40gb",
-        "a100-40gb": "a100-40gb",
-        "a100": "a100-80gb",
-        "h100": "h100",
-        "l40s": "l40s",
-        "l40": "l40s",
-    }
-    s = alias.get(s, s)
+    repaired: list[str] = []
+    for ch in s:
+        oc = ord(ch)
+        if oc >= 32:
+            repaired.append(ch)
+            continue
+        # Map common escape control chars back to textual form.
+        if ch == "\x0b":  # vertical tab (\v)
+            repaired.append("\\v")
+        elif ch == "\t":
+            repaired.append("\\t")
+        elif ch == "\n":
+            repaired.append("\\n")
+        elif ch == "\r":
+            repaired.append("\\r")
+        elif ch == "\f":
+            repaired.append("\\f")
+        elif ch == "\a":
+            repaired.append("\\a")
+        elif ch == "\b":
+            repaired.append("\\b")
+        # Unknown control chars are dropped.
 
-    # Modal now prefers string GPU specs for A100 (avoid modal.gpu.A100).
-    if s == "a100-80gb":
-        return "A100-80GB"
-    if s == "a100-40gb":
-        return "A100-40GB"
+    out = "".join(repaired).strip()
+    print(f"[local] [warn] {key} had control characters; sanitized to: {out!r}")
+    return out
 
-    # Try to construct modal.gpu.* objects if available
-    try:
-        gpu_mod = modal.gpu
-    except Exception:
-        gpu_mod = None
 
-    def _ctor(cls, **kwargs):
-        try:
-            sig = inspect.signature(cls)
-            ok = {k: v for k, v in kwargs.items() if k in sig.parameters}
-            return cls(**ok)
-        except Exception:
-            try:
-                return cls()
-            except Exception:
-                return None
-
-    if gpu_mod is not None:
-        if s == "a100-80gb":
-            cls = getattr(gpu_mod, "A100", None)
-            if cls is not None:
-                # Modal historically used size="80GB"
-                g = _ctor(cls, size="80GB")
-                if g is None:
-                    g = _ctor(cls)
-                return g
-        if s == "a100-40gb":
-            cls = getattr(gpu_mod, "A100", None)
-            if cls is not None:
-                g = _ctor(cls, size="40GB")
-                if g is None:
-                    g = _ctor(cls)
-                return g
-        if s == "a100":
-            cls = getattr(gpu_mod, "A100", None)
-            if cls is not None:
-                g = _ctor(cls)
-                return g
-        if s == "h100":
-            cls = getattr(gpu_mod, "H100", None)
-            if cls is not None:
-                g = _ctor(cls)
-                return g
-        if s == "l40s":
-            cls = getattr(gpu_mod, "L40S", None)
-            if cls is not None:
-                g = _ctor(cls)
-                return g
-
-    # Fallback: pass through string (some Modal versions accept it)
-    # Prefer canonical string for A100-80GB:
-    if s == "a100-80gb":
-        return "A100-80GB"
-    if s == "a100-40gb":
-        return "A100-40GB"
-    if s == "a100":
-        return "A100-80GB"
-    if s == "h100":
-        return "H100"
-    if s == "l40s":
-        return "L40S"
-
-    return spec0
+def _resolve_local_code_dir() -> str:
+    raw = _sanitize_env_path(_env("VGGT_CODE_DIR", "."), "VGGT_CODE_DIR")
+    if not raw:
+        raw = "."
+    p = Path(raw).expanduser()
+    if p.exists():
+        return str(p)
+    cwd = Path.cwd()
+    print(
+        f"[local] [warn] VGGT_CODE_DIR not found: {raw!r}; fallback to cwd: {cwd}")
+    return str(cwd)
 
 
 # --------------------------
 # Config
 # --------------------------
+
+
 @dataclass
 class Cfg:
-    # volumes & paths
-    data_vol: str
-    out_vol: str
+    # code + mounts
     code_dir: str
+    mnt_code: str
+    mnt_data: str
+    mnt_out: str
+
+    # data
     zju_root: str
-    archives_dir: str
-
-    # run
     seq_names: list[str]
-    gpu_spec: str
-    timeout_sec: int
 
-    # training script
-    train_script: str
-    train_args_extra: str
+    # --- pipeline mode ---
+    mode: str = "train"  # "precompute" or "train"
+    precompute_script: str = "precompute_zju_vggt_geom.py"
+    # optional; if set, will be copied to {mnt_code}/model.pt if needed
+    precompute_ckpt: str = ""
+    cam_names: list[str] = field(default_factory=list)
+    max_frames: int = 0  # 0=all
 
-    # hyperparams
-    epochs: int
-    batch_size: int
-    accum_steps: int
-    lr: float
-    lr_schedule: str
-    warmup_steps: int
-    min_lr_ratio: float
-    early_stop: int
+    # run (modal)
+    gpu_spec: str = "A100-80GB"
+    timeout_sec: int = 24 * 60 * 60
 
-    # misc toggles
-    best_by: str
-    use_ema: bool
-    ema_decay: float
-    ema_start_step: int
+    # training
+    train_script: str = "train_view_decoder_ablation.py"
+    train_args_extra: str = ""
+    epochs: int = 50
+    batch_size: int = 3
+    accum_steps: int = 1
+    lr: float = 5e-5
+    lr_schedule: str = "cosine"
+    warmup_steps: int = 400
+    min_lr_ratio: float = 0.1
+    bg_weight: float = 0.05
+    conf_use_quantile_mask: bool = True
+    conf_qlo: float = 0.05
+    conf_qhi: float = 0.95
+    conf_sup_use_quantile: bool = False
+    conf_sup_gamma: float = 1.0
+    use_ema: bool = True
+    ema_decay: float = 0.999
+    best_by: str = "ema"
+    use_view_cond: bool = False
+    view_cond_mode: str = "tgt"
+    tf32: bool = True
+    amp: bool = True
 
-    split_conf_head: bool
-    conf_head_lr_mult: float
+    # volumes
+    data_vol: str = "vggt-zju-data"
+    out_vol: str = "vggt-out"
+    archives_dir: str = "/mnt/data/archives"
 
-    bg_weight: float
-    train_mask_mode: str
-    recon_mask_mode: str
-    recon_weight_renorm: bool
-    recon_weight_clip_max: float
-
-    conf_use_quantile: bool
-    conf_qlo: float
-    conf_qhi: float
-    bad_sample_policy: str
-    white_mean_thr: float
-    white_std_thr: float
-    bad_sample_max_retry: int
-    report_bad_samples: bool
-
-    amp: bool
-    tf32: bool
-
-    debug_train_every: int
-    debug_val_every_epoch: int
-    split_cat_panels: bool
+    # misc
+    nan_check_every: int = 200
+    debug_fixed_batch: bool = False
+    debug_fixed_index: int = 0
 
     @staticmethod
     def from_env() -> "Cfg":
-        data_vol = _env("VGGT_DATA_VOL", DEFAULT_DATA_VOL)
-        out_vol = _env("VGGT_OUT_VOL",  DEFAULT_OUT_VOL)
-        code_dir = _env("VGGT_CODE_DIR", os.getcwd())
-
-        # IMPORTANT: based on your volume screenshots:
-        # vggt-zju-data / zju_mocap / CoreView_390 / ...
-        zju_root = _env("VGGT_ZJU_ROOT", DEFAULT_ZJU_ROOT).strip()
-        if zju_root == "":
-            zju_root = DEFAULT_ZJU_ROOT
-
-        archives_dir = _env("VGGT_ARCHIVES_DIR", DEFAULT_ARCHIVES)
-
-        seq_env = _env("VGGT_SEQ", "CoreView_390")
-        seq_names = _split_seq_names(_env("VGGT_SEQ_NAMES", seq_env))
-
-        gpu_spec = _env("VGGT_GPU", "A100-80GB")
-        timeout_sec = _env_int("VGGT_TIMEOUT_SEC", 24 * 3600)
-
-        train_script = _env("TRAIN_SCRIPT", "train_view_decoder_ablation.py")
-        train_args_extra = _env("TRAIN_ARGS", "")
+        seq_names = _split_seq_names(_env("VGGT_SEQ_NAMES", "CoreView_390"))
+        if not seq_names:
+            raise RuntimeError("VGGT_SEQ_NAMES is empty")
 
         return Cfg(
-            data_vol=data_vol,
-            out_vol=out_vol,
-            code_dir=code_dir,
-            zju_root=zju_root,
-            archives_dir=archives_dir,
+            # mounts
+            code_dir=_resolve_local_code_dir(),
+            mnt_code=_env("VGGT_MNT_CODE", "/mnt/code"),
+            mnt_data=_env("VGGT_MNT_DATA", "/mnt/data"),
+            mnt_out=_env("VGGT_MNT_OUT", "/mnt/out"),
+            # data
+            zju_root=_env("VGGT_ZJU_ROOT", "/mnt/data/zju_mocap"),
             seq_names=seq_names,
-            gpu_spec=gpu_spec,
-            timeout_sec=timeout_sec,
-            train_script=train_script,
-            train_args_extra=train_args_extra,
+            mode=_env("VGGT_MODE", "train").strip() or "train",
+            precompute_script=_env(
+                "VGGT_PRECOMPUTE_SCRIPT", "precompute_zju_vggt_geom.py").strip()
+            or "precompute_zju_vggt_geom.py",
+            precompute_ckpt=_env("VGGT_PRECOMPUTE_CKPT", "").strip(),
+            cam_names=_split_csv_list(_env("VGGT_CAM_NAMES", "")),
+            max_frames=_env_int("VGGT_MAX_FRAMES", 0),
+            # run
+            gpu_spec=_env("VGGT_GPU_SPEC", "A100-80GB"),
+            timeout_sec=_env_int("VGGT_TIMEOUT_SEC", 24 * 60 * 60),
+            # training
+            train_script=_env("VGGT_TRAIN_SCRIPT",
+                              "train_view_decoder_ablation.py"),
+            train_args_extra=_env("VGGT_TRAIN_ARGS_EXTRA", ""),
             epochs=_env_int("VGGT_EPOCHS", 50),
-            batch_size=_env_int("VGGT_BATCH", 3),
-            accum_steps=_env_int("VGGT_ACCUM", 1),
+            batch_size=_env_int("VGGT_BATCH_SIZE", 3),
+            accum_steps=_env_int("VGGT_ACCUM_STEPS", 1),
             lr=_env_float("VGGT_LR", 5e-5),
             lr_schedule=_env("VGGT_LR_SCHEDULE", "cosine"),
-            warmup_steps=_env_int("VGGT_WARMUP", 400),
+            warmup_steps=_env_int("VGGT_WARMUP_STEPS", 400),
             min_lr_ratio=_env_float("VGGT_MIN_LR_RATIO", 0.1),
-            early_stop=_env_int("VGGT_EARLY_STOP", 15),
-            best_by=_env("VGGT_BEST_BY", "raw_psnr"),
-            use_ema=_env_bool("VGGT_USE_EMA", True),
-            ema_decay=_env_float("VGGT_EMA_DECAY", 0.99),
-            ema_start_step=_env_int("VGGT_EMA_START_STEP", 0),
-            split_conf_head=_env_bool("VGGT_SPLIT_CONF_HEAD", True),
-            conf_head_lr_mult=_env_float("VGGT_CONF_HEAD_LR_MULT", 2.0),
             bg_weight=_env_float("VGGT_BG_WEIGHT", 0.05),
-            train_mask_mode=_env("VGGT_TRAIN_MASK_MODE", "fg_conf"),
-            recon_mask_mode=_env("VGGT_RECON_MASK_MODE", "valid"),
-            recon_weight_renorm=_env_bool("VGGT_RECON_WEIGHT_RENORM", True),
-            recon_weight_clip_max=_env_float(
-                "VGGT_RECON_WEIGHT_CLIP_MAX", 1.0),
-            conf_use_quantile=_env_bool("VGGT_CONF_USE_QUANTILE", True),
+            conf_use_quantile_mask=_env_bool(
+                "VGGT_CONF_USE_QUANTILE_MASK", True),
             conf_qlo=_env_float("VGGT_CONF_QLO", 0.05),
             conf_qhi=_env_float("VGGT_CONF_QHI", 0.95),
-            bad_sample_policy=_env("VGGT_BAD_SAMPLE_POLICY", "warn"),
-            white_mean_thr=_env_float("VGGT_WHITE_MEAN_THR", 0.98),
-            white_std_thr=_env_float("VGGT_WHITE_STD_THR", 1e-3),
-            bad_sample_max_retry=_env_int("VGGT_BAD_SAMPLE_MAX_RETRY", 3),
-            report_bad_samples=_env_bool("VGGT_REPORT_BAD_SAMPLES", True),
-            amp=_env_bool("VGGT_AMP", True),
+            conf_sup_use_quantile=_env_bool(
+                "VGGT_CONF_SUP_USE_QUANTILE", False),
+            conf_sup_gamma=_env_float("VGGT_CONF_SUP_GAMMA", 1.0),
+            use_ema=_env_bool("VGGT_USE_EMA", True),
+            ema_decay=_env_float("VGGT_EMA_DECAY", 0.999),
+            best_by=_env("VGGT_BEST_BY", "ema"),
+            use_view_cond=_env_bool("VGGT_USE_VIEW_COND", False),
+            view_cond_mode=_env("VGGT_VIEW_COND_MODE", "tgt"),
             tf32=_env_bool("VGGT_TF32", True),
-            debug_train_every=_env_int("VGGT_DEBUG_TRAIN_EVERY", 200),
-            debug_val_every_epoch=_env_int("VGGT_DEBUG_VAL_EVERY_EPOCH", 1),
-            split_cat_panels=_env_bool("VGGT_SPLIT_CAT_PANELS", True),
+            amp=_env_bool("VGGT_AMP", True),
+            # volumes
+            data_vol=_env("VGGT_DATA_VOL", "vggt-zju-data"),
+            out_vol=_env("VGGT_OUT_VOL", "vggt-out"),
+            archives_dir=_env("VGGT_ARCHIVES_DIR", "/mnt/data/archives"),
+            # misc
+            nan_check_every=_env_int("VGGT_NAN_CHECK_EVERY", 200),
+            debug_fixed_batch=_env_bool("VGGT_DEBUG_FIXED_BATCH", False),
+            debug_fixed_index=_env_int("VGGT_DEBUG_FIXED_INDEX", 0),
         )
 
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), ensure_ascii=False)
+
+    @staticmethod
+    def from_json(s: str) -> "Cfg":
+        return Cfg(**json.loads(s))
+
 
 # --------------------------
-# Modal setup (read env at import time)
+# Volumes + mounts
 # --------------------------
+
 CFG_IMPORT = Cfg.from_env()
 
 DATA_VOL = modal.Volume.from_name(CFG_IMPORT.data_vol, create_if_missing=False)
-OUT_VOL = modal.Volume.from_name(CFG_IMPORT.out_vol,  create_if_missing=False)
+OUT_VOL = modal.Volume.from_name(CFG_IMPORT.out_vol, create_if_missing=False)
 
-GPU_OBJ = _make_gpu_from_spec(CFG_IMPORT.gpu_spec)
+MNT_CODE = CFG_IMPORT.mnt_code
+MNT_DATA = CFG_IMPORT.mnt_data
+MNT_OUT = CFG_IMPORT.mnt_out
 
-# Keep image simple; your repo typically installs torch in its own way.
-# If你已经在你自己的 modal image 里装好了依赖，也可以把 pip_install 删掉。
+# Use string GPU spec (avoid deprecated modal.gpu.A100(...))
+GPU_ARG = (CFG_IMPORT.gpu_spec.strip() or None)
+if GPU_ARG and GPU_ARG.lower() in ("none", "cpu", "false", "0"):
+    GPU_ARG = None
+
+# Image: include deps for both precompute + training
 IMAGE = (
-    modal.Image.from_registry('pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime')
-    .pip_install(
-        "numpy",
-        "opencv-python-headless",
-        "pyyaml",
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install('huggingface_hub','torch','torchvision',"numpy",
         "tqdm",
+        "einops",
         "pillow",
+        "opencv-python-headless",
         "matplotlib",
         "scipy",
     )
 )
 
-APP_NAME = _env("VGGT_APP_NAME", "vggt-train")
-app = modal.App(APP_NAME)
+app = modal.App("vggt-zju-runner")
 
 
-def _print_tree(root: Path, max_items: int = 200):
-    root = Path(root)
+# --------------------------
+# Utilities
+# --------------------------
+
+
+def _run_cmd(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
+    print("[remote] $", " ".join(cmd))
+    t0 = time.time()
+    p = subprocess.Popen(
+        cmd,
+        cwd=str(cwd) if cwd is not None else None,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        universal_newlines=True,
+    )
+    assert p.stdout is not None
+    for line in p.stdout:
+        print(line.rstrip("\n"))
+    rc = p.wait()
+    dt = time.time() - t0
+    if rc != 0:
+        raise RuntimeError(
+            f"command failed (rc={rc}, {dt:.1f}s): {' '.join(cmd)}")
+    print(f"[remote] [ok] finished in {dt:.1f}s")
+
+
+def _print_tree(root: Path, max_items: int = 80) -> None:
+    print(f"[remote] dataset sample tree: {root}")
     if not root.exists():
-        print(f"[tree] missing: {root}")
+        print("[remote] [warn] path does not exist")
         return
-    items = []
-    for x in sorted(root.iterdir(), key=lambda p: p.name):
-        items.append(f"{x.name}{'/' if x.is_dir() else ''}")
-        if len(items) >= max_items:
-            items.append("... (truncated)")
+    cnt = 0
+    for p in root.rglob("*"):
+        if cnt >= max_items:
+            print(f"[remote] ... (truncated after {max_items} items)")
             break
-    print(f"[tree] {root} -> {len(items)} entries")
-    for it in items[:30]:
-        print("  -", it)
-    if len(items) > 30:
-        print("  - ...")
+        rel = p.relative_to(root)
+        if p.is_dir():
+            print(f"[remote] [d] {rel}/")
+        else:
+            try:
+                sz = p.stat().st_size
+            except Exception:
+                sz = -1
+            print(f"[remote] [f] {rel} ({sz} bytes)")
+        cnt += 1
 
 
-def _find_seq_dir(zju_root: Path, seq: str) -> Path | None:
-    zju_root = Path(zju_root)
-    cand = zju_root / seq
-    if (cand / "vggt_geom").exists():
-        return cand
-    # fallback: maybe zju_root itself is seq dir
-    if (zju_root / "vggt_geom").exists():
-        return zju_root
-    return None
+def _find_seq_dir(zju_root: Path, seq: str) -> Path:
+    # ZJU mocap: /mnt/data/zju_mocap/CoreView_390
+    p = zju_root / seq
+    if p.exists():
+        return p
+    raise RuntimeError(f"[remote] seq dir not found: {p}")
 
 
-def _ensure_dataset(cfg: Cfg):
+def _ensure_dataset(cfg: Cfg) -> None:
     """
-    Ensure that zju_root/seq/vggt_geom exists.
-    Based on your screenshot, correct layout is:
-      /mnt/data/zju_mocap/CoreView_390/vggt_geom
+    Training requires {zju_root}/{seq}/vggt_geom to exist.
+    If not, try to extract from {archives_dir}/{seq}/... if present.
     """
     zju_root = Path(cfg.zju_root)
-    if not zju_root.exists():
-        print(f"[data] zju_root not found: {zju_root}")
-        print(f"[data] listing {Path(MNT_DATA)}:")
-        _print_tree(Path(MNT_DATA), max_items=200)
+    archives_dir = Path(cfg.archives_dir)
 
-    missing = []
     for seq in cfg.seq_names:
         seq_dir = _find_seq_dir(zju_root, seq)
-        if seq_dir is None or not (seq_dir / "vggt_geom").exists():
-            missing.append(seq)
+        geom_dir = seq_dir / "vggt_geom"
+        if geom_dir.exists():
+            print(f"[remote] [ok] found vggt_geom: {geom_dir}")
+            continue
 
-    if not missing:
-        print(f"[data] ok: zju_root={zju_root} has all seqs {cfg.seq_names}")
-        return
+        # Attempt extraction from archives
+        arc_seq = archives_dir / seq
+        if not arc_seq.exists():
+            raise RuntimeError(
+                f"[remote] missing vggt_geom and no archives found.\n"
+                f"  need: {geom_dir}\n"
+                f"  archives_dir: {arc_seq} (not found)"
+            )
 
-    # If missing, try extraction from archives (only if archives exist)
-    archives = Path(cfg.archives_dir)
-    print(f"[data] missing seq(s): {missing}")
-    print(f"[data] trying archives at: {archives}")
-    _print_tree(archives, max_items=200)
+        # Extract all .tar / .tar.gz / .tgz under arc_seq into seq_dir
+        print(
+            f"[remote] [warn] vggt_geom missing, extracting archives from: {arc_seq}")
+        seq_dir.mkdir(parents=True, exist_ok=True)
+        extracted_any = False
+        for tar_path in sorted(arc_seq.rglob("*.tar*")):
+            extracted_any = True
+            _run_cmd(["tar", "-xf", str(tar_path), "-C", str(seq_dir)])
+        if not extracted_any:
+            raise RuntimeError(
+                f"[remote] archives dir exists but no tar files: {arc_seq}")
 
-    for seq in missing:
-        tar_path = archives / f"{seq}.tar"
-        if not tar_path.exists():
-            # try assembling parts
-            parts = sorted(archives.glob(f"{seq}.tar.part*"))
-            if parts:
-                tar_path = archives / f"{seq}.tar"
-                if not tar_path.exists():
-                    print(
-                        f"[data] assembling {tar_path} from {len(parts)} parts...")
-                    with open(tar_path, "wb") as w:
-                        for p in parts:
-                            print("  [part]", p.name)
-                            with open(p, "rb") as r:
-                                shutil.copyfileobj(
-                                    r, w, length=16 * 1024 * 1024)
-                    print(f"[data] assembled: {tar_path}")
-            else:
-                print(f"[data] no tar or parts found for {seq} in {archives}")
-                continue
+        if not geom_dir.exists():
+            raise RuntimeError(
+                f"[remote] after extraction, still missing: {geom_dir}")
 
-        # Extract into zju_root (expects it contains seq folder)
-        print(f"[data] extracting {tar_path} -> {zju_root}")
-        zju_root.mkdir(parents=True, exist_ok=True)
-
-        # system tar is faster than python tarfile for huge archives
-        subprocess.check_call(
-            ["tar", "xf", str(tar_path), "-C", str(zju_root)])
-
-        # Verify layout; if tar extracted files directly (no seq folder),
-        # create a symlink at parent to satisfy expected zju_root/seq layout
-        seq_dir = _find_seq_dir(zju_root, seq)
-        if seq_dir is None:
-            # Search one level deep for vggt_geom
-            geom_hits = list(zju_root.glob("**/vggt_geom"))
-            if geom_hits:
-                real_seq_dir = geom_hits[0].parent
-                print(f"[data] found vggt_geom at: {real_seq_dir}")
-                parent = real_seq_dir.parent
-                link = parent / seq
-                if not link.exists() and str(link) != str(real_seq_dir):
-                    try:
-                        link.symlink_to(real_seq_dir, target_is_directory=True)
-                        print(f"[data] symlinked {link} -> {real_seq_dir}")
-                    except Exception as e:
-                        print(f"[data] symlink failed: {e}")
-            else:
-                print("[data] extraction done but still can't find vggt_geom")
-
-    # persist changes
-    try:
-        DATA_VOL.commit()
-        print("[data] committed data volume")
-    except Exception as e:
-        print(f"[data] commit skipped/failed: {e}")
+        print(f"[remote] [ok] extracted vggt_geom: {geom_dir}")
 
 
 def _build_train_cmd(cfg: Cfg) -> list[str]:
-    """
-    Map env->train_view_decoder_ablation.py args.
-    """
-    tag = time.strftime("%Y%m%d_%H%M%S")
-    seq_tag = cfg.seq_names[0] if cfg.seq_names else "SEQ"
-    log_dir = f"{MNT_OUT}/vggt/runs/{seq_tag}_{tag}"
-    ckpt_dir = f"{MNT_OUT}/vggt/ckpt/{seq_tag}_{tag}"
+    # Call the repo train script with env + args.
+    code_dir = Path(MNT_CODE)
+    script = code_dir / cfg.train_script
+    if not script.exists():
+        raise RuntimeError(f"[remote] train_script not found: {script}")
 
-    cmd = [
-        sys.executable,
-        str(Path(MNT_CODE) / cfg.train_script),
-        "--zju_root", cfg.zju_root,
-        "--seq_names", ",".join(cfg.seq_names),
-        "--epochs", str(cfg.epochs),
-        "--batch_size", str(cfg.batch_size),
-        "--accum_steps", str(cfg.accum_steps),
-        "--lr", str(cfg.lr),
-        "--lr_schedule", cfg.lr_schedule,
-        "--warmup_steps", str(cfg.warmup_steps),
-        "--min_lr_ratio", str(cfg.min_lr_ratio),
-        "--early_stop", str(cfg.early_stop),
-        "--best_by", cfg.best_by,
-        "--ema_decay", str(cfg.ema_decay),
-        "--ema_start_step", str(cfg.ema_start_step),
-        "--conf_head_lr_mult", str(cfg.conf_head_lr_mult),
-        "--bg_weight", str(cfg.bg_weight),
-        "--train_mask_mode", cfg.train_mask_mode,
-        "--recon_mask_mode", cfg.recon_mask_mode,
-        "--recon_weight_clip_max", str(cfg.recon_weight_clip_max),
-        "--conf_qlo", str(cfg.conf_qlo),
-        "--conf_qhi", str(cfg.conf_qhi),
-        "--bad_sample_policy", cfg.bad_sample_policy,
-        "--white_mean_thr", str(cfg.white_mean_thr),
-        "--white_std_thr", str(cfg.white_std_thr),
-        "--bad_sample_max_retry", str(cfg.bad_sample_max_retry),
-        "--debug_train_every", str(cfg.debug_train_every),
-        "--debug_val_every_epoch", str(cfg.debug_val_every_epoch),
-        "--log_dir", log_dir,
-        "--ckpt_dir", ckpt_dir,
+    run_tag = time.strftime("%Y%m%d_%H%M%S")
+    seq_tag = cfg.seq_names[0] if cfg.seq_names else "seq"
+    run_root = Path(MNT_OUT) / "viewdec_ablation" / f"{seq_tag}_{run_tag}"
+    log_dir = run_root / "logs"
+    ckpt_dir = run_root / "ckpt"
+
+    args = [
+        f"--zju_root={cfg.zju_root}",
+        f"--seq_names={','.join(cfg.seq_names)}",
+        f"--log_dir={str(log_dir)}",
+        f"--ckpt_dir={str(ckpt_dir)}",
+        f"--epochs={cfg.epochs}",
+        f"--batch_size={cfg.batch_size}",
+        f"--accum_steps={cfg.accum_steps}",
+        f"--lr={cfg.lr}",
+        f"--lr_schedule={cfg.lr_schedule}",
+        f"--warmup_steps={cfg.warmup_steps}",
+        f"--min_lr_ratio={cfg.min_lr_ratio}",
+        f"--bg_weight={cfg.bg_weight}",
+        f"--conf_qlo={cfg.conf_qlo}",
+        f"--conf_qhi={cfg.conf_qhi}",
+        f"--ema_decay={cfg.ema_decay}",
+        f"--nan_check_every={cfg.nan_check_every}",
     ]
-
+    if cfg.conf_use_quantile_mask:
+        args.append("--conf_use_quantile")
+    else:
+        args.append("--no_conf_use_quantile")
+    if cfg.conf_sup_use_quantile:
+        args.append("--conf_sup_use_quantile")
+        args.append(f"--conf_sup_gamma={cfg.conf_sup_gamma}")
     if cfg.use_ema:
-        # default in script is True, but explicit is fine
-        cmd.append("--use_ema")
+        args.append("--use_ema")
     else:
-        cmd.append("--no_use_ema")
-
-    if cfg.split_conf_head:
-        cmd.append("--split_conf_head")
-
-    if cfg.recon_weight_renorm:
-        cmd.append("--recon_weight_renorm")
-    else:
-        cmd.append("--no_recon_weight_renorm")
-
-    if cfg.conf_use_quantile:
-        cmd.append("--conf_use_quantile")
-    else:
-        cmd.append("--no_conf_use_quantile")
-
-    if cfg.report_bad_samples:
-        cmd.append("--report_bad_samples")
-    else:
-        cmd.append("--no_report_bad_samples")
-
-    if cfg.amp:
-        cmd.append("--amp")
-    else:
-        cmd.append("--no_amp")
-
+        args.append("--no_use_ema")
+    if cfg.best_by:
+        args.append(f"--best_by={cfg.best_by}")
+    if cfg.use_view_cond:
+        args.append("--use_view_cond")
+        args.append(f"--view_cond_mode={cfg.view_cond_mode}")
     if cfg.tf32:
-        cmd.append("--tf32")
+        args.append("--tf32")
     else:
-        cmd.append("--no_tf32")
-
-    if cfg.split_cat_panels:
-        cmd.append("--split_cat_panels")
+        args.append("--no_tf32")
+    if cfg.amp:
+        args.append("--amp")
     else:
-        cmd.append("--no_split_cat_panels")
+        args.append("--no_amp")
+    if cfg.debug_fixed_batch:
+        args.append("--debug_fixed_batch")
+    else:
+        args.append("--no_debug_fixed_batch")
+    args.append(f"--debug_fixed_index={cfg.debug_fixed_index}")
 
-    extra = (cfg.train_args_extra or "").strip()
-    if extra:
-        cmd += shlex.split(extra)
+    # Extra user-provided args
+    if cfg.train_args_extra.strip():
+        args.extend(shlex.split(cfg.train_args_extra))
 
-    return cmd
+    return [sys.executable, str(script)] + args
 
 
-IMAGE = IMAGE.add_local_dir(os.environ.get('VGGT_CODE_DIR','.'), remote_path='/mnt/code')
+def _resolve_script_path(code_dir: Path, script: str) -> Path:
+    """Resolve script relative to code_dir; fallback to recursive search."""
+    p = Path(script)
+    if p.is_absolute() and p.exists():
+        return p
+    cand = (code_dir / script)
+    if cand.exists():
+        return cand
+    # fallback: search by basename
+    base = Path(script).name
+    for q in code_dir.rglob(base):
+        if q.is_file():
+            return q
+    return cand
+
+
+def _basename_cross_platform(path_str: str) -> str:
+    s = (path_str or "").strip().replace("\\", "/").rstrip("/")
+    if not s:
+        return ""
+    return s.split("/")[-1]
+
+
+def _resolve_precompute_ckpt_path(code_dir: Path, ckpt: str) -> Path:
+    """
+    Resolve checkpoint path inside container.
+    Accepts Linux absolute paths, code_dir-relative paths, and Windows-style
+    paths by mapping them to code_dir/<basename>.
+    """
+    raw = (ckpt or "").strip()
+    default_ckpt = code_dir / "model.pt"
+
+    if not raw:
+        return default_ckpt
+
+    p = Path(raw)
+    if p.is_absolute() and p.exists():
+        return p
+
+    if not p.is_absolute():
+        rel = code_dir / raw
+        if rel.exists():
+            return rel
+
+    base = _basename_cross_platform(raw)
+    if base:
+        by_base = code_dir / base
+        if by_base.exists():
+            return by_base
+
+    # Preserve absolute path intent even if currently missing, for clearer errors.
+    if p.is_absolute():
+        return p
+    return default_ckpt
+
+
+def _run_precompute(cfg: Cfg, code_dir: Path) -> None:
+    script_path = _resolve_script_path(code_dir, cfg.precompute_script)
+    if not script_path.exists():
+        # Provide a helpful directory listing for debugging.
+        try:
+            items = sorted([p.name for p in code_dir.iterdir()])
+            print("[remote] [dbg] code_dir listing (top-level):", items[:200])
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"[remote] precompute_script not found: {script_path}")
+    ckpt_path = _resolve_precompute_ckpt_path(code_dir, cfg.precompute_ckpt)
+    if not ckpt_path.exists():
+        try:
+            top = sorted([p.name for p in code_dir.iterdir() if p.is_file()])
+        except Exception:
+            top = []
+        raise RuntimeError(
+            "[remote] checkpoint not found for precompute.\n"
+            f"  requested: {cfg.precompute_ckpt!r}\n"
+            f"  resolved: {ckpt_path}\n"
+            f"  code_dir: {code_dir}\n"
+            f"  top-level files sample: {top[:80]}"
+        )
+    print(f"[remote] precompute ckpt = {ckpt_path}")
+
+    env = os.environ.copy()
+    env["VGGT_ZJU_ROOT"] = str(cfg.zju_root)
+    env["VGGT_SEQ_NAMES"] = ",".join(cfg.seq_names)
+    env["VGGT_CKPT"] = str(ckpt_path)
+    env["VGGT_PRECOMPUTE_CKPT"] = str(ckpt_path)
+    if cfg.cam_names:
+        env["VGGT_CAM_NAMES"] = ",".join(cfg.cam_names)
+    if int(cfg.max_frames) > 0:
+        env["VGGT_MAX_FRAMES"] = str(int(cfg.max_frames))
+    # Make sure code is importable
+    env["PYTHONPATH"] = str(
+        code_dir) + (":" + env.get("PYTHONPATH", "") if env.get("PYTHONPATH") else "")
+
+    # Run via runpy so the script can stay argument-free.
+    parts = [
+        "import os,runpy; ",
+        f"os.environ.setdefault('VGGT_ZJU_ROOT',{cfg.zju_root!r}); ",
+        f"os.environ.setdefault('VGGT_SEQ_NAMES',{','.join(cfg.seq_names)!r}); ",
+        f"os.environ.setdefault('VGGT_CKPT',{str(ckpt_path)!r}); ",
+        f"os.environ.setdefault('VGGT_PRECOMPUTE_CKPT',{str(ckpt_path)!r}); ",
+    ]
+    if cfg.cam_names:
+        parts.append(
+            f"os.environ.setdefault('VGGT_CAM_NAMES',{','.join(cfg.cam_names)!r}); ")
+    if int(cfg.max_frames) > 0:
+        parts.append(
+            f"os.environ.setdefault('VGGT_MAX_FRAMES',{str(int(cfg.max_frames))!r}); ")
+    parts.append(f"runpy.run_path({str(script_path)!r}, run_name='__main__')")
+    py = "".join(parts)
+    cmd = [sys.executable, "-c", py]
+    print("[remote] precompute cmd:", " ".join(cmd))
+    _run_cmd(cmd, cwd=code_dir, env=env)
+
+
+# --------------------------
+# Modal remote entry
+# --------------------------
+
+
 @app.function(
-    image=IMAGE,
-    gpu=GPU_OBJ,
+    image=IMAGE.add_local_dir(
+        str(Path(CFG_IMPORT.code_dir).resolve()), remote_path=str(CFG_IMPORT.mnt_code)),
+    gpu=GPU_ARG,
     timeout=CFG_IMPORT.timeout_sec,
-    volumes={MNT_DATA: DATA_VOL, MNT_OUT: OUT_VOL},
+    volumes={
+        MNT_DATA: DATA_VOL,
+        MNT_OUT: OUT_VOL,
+    },
 )
-def run_remote(cfg_json: str):
-    cfg = Cfg(**json.loads(cfg_json))
+def run_remote(cfg_json: str) -> None:
+    cfg = Cfg.from_json(cfg_json)
+    print("[remote] cfg.seq_names =", cfg.seq_names)
+    print("[remote] cfg.zju_root =", cfg.zju_root)
+    print("[remote] cfg.mode =", cfg.mode)
 
-    print("[remote] cfg:")
-    for k, v in asdict(cfg).items():
-        print(f"  {k} = {v}")
-
-    # Ensure code exists
     code_dir = Path(MNT_CODE)
     if not code_dir.exists():
-        # [auto] code mount fallback begin
-        code_src = os.path.dirname(__file__)
-        try:
-            if not os.path.exists(MNT_CODE):
-                os.makedirs(os.path.dirname(MNT_CODE), exist_ok=True)
-                try:
-                    os.symlink(code_src, MNT_CODE)
-                    print('[remote] created symlink: ' + str(MNT_CODE) + ' -> ' + str(code_src))
-                except Exception as e:
-                    print('[remote] cannot symlink ' + str(MNT_CODE) + ' : ' + str(e) + ' ; will use code_src=' + str(code_src))
-        except Exception as e:
-            print('[remote] code mount fallback failed: ' + str(e) + ' ; continue')
-        try:
-            import sys as _sys
-            if code_src not in _sys.path: _sys.path.insert(0, code_src)
-            if os.path.exists(MNT_CODE) and MNT_CODE not in _sys.path: _sys.path.insert(0, MNT_CODE)
-        except Exception as e:
-            print('[remote] sys.path fallback failed: ' + str(e))
-        print('[remote] warning: missing code mount; fallback applied; continue')
-        # [auto] code mount fallback end
+        raise RuntimeError(f"[remote] code dir missing: {code_dir}")
 
+    # Make sure the invoked module dir is the repo root.
     os.chdir(code_dir)
-    print(f"[remote] cwd={Path.cwd()}")
-
-    # Validate dataset path based on your screenshots:
-    # /mnt/data/zju_mocap/CoreView_390/...
-    _ensure_dataset(cfg)
 
     # Show dataset tree head
     zju_root = Path(cfg.zju_root)
-    _print_tree(zju_root, max_items=120)
-    for seq in cfg.seq_names[:2]:
-        _print_tree(zju_root / seq, max_items=80)
+    # show one seq head for sanity
+    _print_tree(zju_root / cfg.seq_names[0], max_items=80)
+
+    if str(cfg.mode).lower().startswith("pre"):
+        print("[remote] mode = precompute")
+        _run_precompute(cfg, code_dir)
+        try:
+            DATA_VOL.commit()
+            print("[remote] committed data volume")
+        except Exception as e:
+            print(f"[remote] commit skipped/failed: {e}")
+        return
+
+    # training path: ensure vggt_geom exists (or extract)
+    _ensure_dataset(cfg)
 
     cmd = _build_train_cmd(cfg)
-    print("[remote] running cmd:")
-    print(" ", " ".join(cmd))
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(
+        code_dir) + (":" + env.get("PYTHONPATH", "") if env.get("PYTHONPATH") else "")
+    _run_cmd(cmd, cwd=code_dir, env=env)
 
-    # [auto] fix: debug_val_every_epoch is a flag
-    # remove accidental value after --debug_val_every_epoch (it is a flag)
-    if '--debug_val_every_epoch' in cmd:
-        i = cmd.index('--debug_val_every_epoch')
-        if i+1 < len(cmd) and (not str(cmd[i+1]).startswith('-')):
-            cmd.pop(i+1)
-
-    subprocess.check_call(cmd)
-
-    # Persist outputs
+    # persist out volume
     try:
         OUT_VOL.commit()
         print("[remote] committed out volume")
@@ -603,34 +633,12 @@ def run_remote(cfg_json: str):
 
 
 @app.local_entrypoint()
-def main(
-    bad_sample_policy: str = CFG_IMPORT.bad_sample_policy,
-    white_mean_thr: float = CFG_IMPORT.white_mean_thr,
-    white_std_thr: float = CFG_IMPORT.white_std_thr,
-    bad_sample_max_retry: int = CFG_IMPORT.bad_sample_max_retry,
-    report_bad_samples: bool = CFG_IMPORT.report_bad_samples,
-):
+def main() -> None:
     cfg = Cfg.from_env()
-    if not cfg.seq_names:
-        raise SystemExit(
-            "VGGT_SEQ/VGGT_SEQ_NAMES is empty; set at least one seq like CoreView_390")
+    print("[local] cfg =", cfg)
+    run_remote.remote(cfg.to_json())
 
-    cfg.bad_sample_policy = bad_sample_policy
-    cfg.white_mean_thr = white_mean_thr
-    cfg.white_std_thr = white_std_thr
-    cfg.bad_sample_max_retry = bad_sample_max_retry
-    cfg.report_bad_samples = report_bad_samples
 
-    # Print minimal sanity based on your volume screenshots
-    print("[local] NOTE: dataset layout (from your screenshots) is:")
-    print("        /mnt/data/zju_mocap/CoreView_390/...")
-
-    print("[local] cfg summary:")
-    for k, v in asdict(cfg).items():
-        if k in ("train_args_extra",):
-            continue
-        print(f"  {k} = {v}")
-    if cfg.train_args_extra.strip():
-        print("  train_args_extra =", cfg.train_args_extra)
-
-    run_remote.remote(json.dumps(asdict(cfg)))
+if __name__ == "__main__":
+    with app.run():
+        main()

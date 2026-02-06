@@ -249,6 +249,46 @@ def _ensure_4d(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     return x
 
 
+def apply_valid_to_depth_conf(
+    src_depth_conf: torch.Tensor,
+    src_depth: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """
+    Keep source depth confidence only on valid source depth pixels.
+    valid := finite(depth) and depth > 0
+    """
+    if not torch.is_tensor(src_depth_conf):
+        return src_depth_conf
+
+    conf_in = src_depth_conf
+    conf = src_depth_conf.float()
+    valid = torch.isfinite(conf)
+
+    if src_depth is not None and torch.is_tensor(src_depth):
+        depth = src_depth.to(device=conf.device).float()
+        depth_valid = torch.isfinite(depth) & (depth > 0)
+
+        # Align rank for common layouts: (B,V,H,W) / (B,V,1,H,W).
+        while depth_valid.dim() < conf.dim():
+            depth_valid = depth_valid.unsqueeze(-3)
+
+        # Channel fallback: reduce depth channel if conf has singleton channel.
+        if depth_valid.dim() == conf.dim() and depth_valid.shape[-3] != conf.shape[-3]:
+            if conf.shape[-3] == 1 and depth_valid.shape[-3] > 1:
+                depth_valid = depth_valid.any(dim=-3, keepdim=True)
+
+        try:
+            depth_valid = depth_valid.expand_as(conf)
+            valid = valid & depth_valid
+        except Exception:
+            # Keep finite-conf behavior when shapes are not broadcastable.
+            pass
+
+    out = torch.where(valid, conf, torch.zeros_like(conf))
+    out = torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
+    return out.to(dtype=conf_in.dtype)
+
+
 # ---------------------------
 # FIX: robust [0,1] for binary-like masks
 # ---------------------------
