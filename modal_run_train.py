@@ -152,7 +152,8 @@ class Cfg:
     # training
     train_script: str = "train_view_decoder_ablation.py"
     train_args_extra: str = ""
-    epochs: int = 50
+    epochs: int = 150
+    resume: str = "auto"
     batch_size: int = 3
     accum_steps: int = 1
     lr: float = 5e-5
@@ -167,6 +168,15 @@ class Cfg:
     conf_qhi: float = 0.95
     conf_sup_use_quantile: bool = False
     conf_sup_gamma: float = 1.0
+    lambda_conf_mean: float = 1e-3
+    conf_mean_target: float = 0.5
+    fg_drop_ground: bool = True
+    fg_ground_method: str = "plane"
+    fg_ground_margin: float = 0.05
+    fg_ground_min_points: int = 256
+    fg_dilate_k: int = 5
+    conf_smooth_k: int = 3
+    conf_smooth_passes: int = 1
     use_ema: bool = True
     ema_decay: float = 0.999
     best_by: str = "ema"
@@ -194,7 +204,7 @@ class Cfg:
 
     # misc
     nan_check_every: int = 200
-    debug_fixed_batch: bool = False
+    debug_fixed_batch: bool = True
     debug_fixed_index: int = 0
 
     @staticmethod
@@ -226,7 +236,8 @@ class Cfg:
             train_script=_env("VGGT_TRAIN_SCRIPT",
                               "train_view_decoder_ablation.py"),
             train_args_extra=_env("VGGT_TRAIN_ARGS_EXTRA", ""),
-            epochs=_env_int("VGGT_EPOCHS", 50),
+            epochs=_env_int("VGGT_EPOCHS", 150),
+            resume=_env("VGGT_RESUME", "auto"),
             batch_size=_env_int("VGGT_BATCH_SIZE", 3),
             accum_steps=_env_int("VGGT_ACCUM_STEPS", 1),
             lr=_env_float("VGGT_LR", 5e-5),
@@ -243,6 +254,15 @@ class Cfg:
             conf_sup_use_quantile=_env_bool(
                 "VGGT_CONF_SUP_USE_QUANTILE", False),
             conf_sup_gamma=_env_float("VGGT_CONF_SUP_GAMMA", 1.0),
+            lambda_conf_mean=_env_float("VGGT_LAMBDA_CONF_MEAN", 1e-3),
+            conf_mean_target=_env_float("VGGT_CONF_MEAN_TARGET", 0.5),
+            fg_drop_ground=_env_bool("VGGT_FG_DROP_GROUND", True),
+            fg_ground_method=_env("VGGT_FG_GROUND_METHOD", "plane"),
+            fg_ground_margin=_env_float("VGGT_FG_GROUND_MARGIN", 0.05),
+            fg_ground_min_points=_env_int("VGGT_FG_GROUND_MIN_POINTS", 256),
+            fg_dilate_k=_env_int("VGGT_FG_DILATE_K", 5),
+            conf_smooth_k=_env_int("VGGT_CONF_SMOOTH_K", 3),
+            conf_smooth_passes=_env_int("VGGT_CONF_SMOOTH_PASSES", 1),
             use_ema=_env_bool("VGGT_USE_EMA", True),
             ema_decay=_env_float("VGGT_EMA_DECAY", 0.999),
             best_by=_env("VGGT_BEST_BY", "ema"),
@@ -268,7 +288,7 @@ class Cfg:
             archives_dir=_env("VGGT_ARCHIVES_DIR", "/mnt/data/archives"),
             # misc
             nan_check_every=_env_int("VGGT_NAN_CHECK_EVERY", 200),
-            debug_fixed_batch=_env_bool("VGGT_DEBUG_FIXED_BATCH", False),
+            debug_fixed_batch=_env_bool("VGGT_DEBUG_FIXED_BATCH", True),
             debug_fixed_index=_env_int("VGGT_DEBUG_FIXED_INDEX", 0),
         )
 
@@ -444,9 +464,13 @@ def _build_train_cmd(cfg: Cfg) -> list[str]:
         f"--bg_weight={cfg.bg_weight}",
         f"--conf_qlo={cfg.conf_qlo}",
         f"--conf_qhi={cfg.conf_qhi}",
+        f"--lambda_conf_mean={cfg.lambda_conf_mean}",
+        f"--conf_mean_target={cfg.conf_mean_target}",
         f"--ema_decay={cfg.ema_decay}",
         f"--nan_check_every={cfg.nan_check_every}",
     ]
+    if (cfg.resume or "").strip():
+        args.append(f"--resume={cfg.resume}")
     if cfg.conf_use_quantile_mask:
         args.append("--conf_use_quantile")
     else:
@@ -488,6 +512,12 @@ def _build_train_cmd(cfg: Cfg) -> list[str]:
             f"--yaw_center_mode={cfg.yaw_center_mode}",
             f"--train_mask_mode={cfg.train_mask_mode}",
             f"--recon_mask_mode={cfg.recon_mask_mode}",
+            f"--fg_dilate_k={int(cfg.fg_dilate_k)}",
+            f"--fg_ground_method={cfg.fg_ground_method}",
+            f"--fg_ground_margin={cfg.fg_ground_margin}",
+            f"--fg_ground_min_points={int(cfg.fg_ground_min_points)}",
+            f"--conf_smooth_k={int(cfg.conf_smooth_k)}",
+            f"--conf_smooth_passes={int(cfg.conf_smooth_passes)}",
             f"--mosaic_every_steps={int(cfg.mosaic_every_steps)}",
             f"--mosaic_num_targets={int(cfg.mosaic_num_targets)}",
             f"--mosaic_num_src_views={int(cfg.mosaic_num_src_views)}",
@@ -495,6 +525,10 @@ def _build_train_cmd(cfg: Cfg) -> list[str]:
             f"--mosaic_point_stride={int(cfg.mosaic_point_stride)}",
             f"--mosaic_seed={int(cfg.mosaic_seed)}",
         ])
+        if cfg.fg_drop_ground:
+            args.append("--fg_drop_ground")
+        else:
+            args.append("--no_fg_drop_ground")
 
     # Extra user-provided args
     if cfg.train_args_extra.strip():

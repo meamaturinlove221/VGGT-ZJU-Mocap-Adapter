@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, Any, List
 
 import numpy as np
 from PIL import Image
@@ -68,6 +68,259 @@ def resize_img_bilinear(img: torch.Tensor, size_hw: Tuple[int, int]) -> torch.Te
 
 def binarize(mask: torch.Tensor, thresh: float = 0.5) -> torch.Tensor:
     return (mask.float() >= thresh).float()
+
+
+def smooth_confidence_map(
+    conf: Optional[torch.Tensor],
+    kernel_size: int = 3,
+    passes: int = 1,
+) -> Optional[torch.Tensor]:
+    """
+    Lightly smooth confidence maps to reduce speckle before gating/weighting.
+    conf: (H,W)/(1,H,W)/(B,1,H,W)/(B,C,H,W)
+    """
+    if conf is None:
+        return None
+    k = int(kernel_size)
+    if k <= 1:
+        return conf
+    if (k % 2) == 0:
+        k += 1
+    n_pass = max(1, int(passes))
+
+    x = conf.float()
+    if x.dim() == 2:
+        x = x[None, None, ...]
+    elif x.dim() == 3:
+        x = x[:, None, ...] if x.shape[0] > 1 else x[None, ...]
+        if x.dim() == 3:
+            x = x[:, None, ...]
+    elif x.dim() == 4:
+        pass
+    else:
+        raise ValueError(f"smooth_confidence_map expects 2D/3D/4D, got {tuple(x.shape)}")
+
+    for _ in range(n_pass):
+        x = F.avg_pool2d(x, kernel_size=k, stride=1,
+                         padding=k // 2, count_include_pad=False)
+    x = x.clamp(0.0, 1.0)
+
+    if conf.dim() == 2:
+        return x[0, 0]
+    if conf.dim() == 3:
+        if conf.shape[0] > 1:
+            return x[:, 0]
+        return x[0]
+    return x
+
+
+def _safe_quantile(x: torch.Tensor, q: float) -> Optional[torch.Tensor]:
+    if x is None or x.numel() == 0:
+        return None
+    qv = float(q)
+    if qv <= 0.0:
+        return x.min()
+    if qv >= 1.0:
+        return x.max()
+    try:
+        return torch.quantile(x, qv)
+    except Exception:
+        flat = x.reshape(-1)
+        k = int(round(qv * (flat.numel() - 1)))
+        k = max(0, min(flat.numel() - 1, k))
+        return flat.kthvalue(k + 1).values
+
+
+def _as_pointmap_b3hw(pointmap: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if pointmap is None or (not torch.is_tensor(pointmap)):
+        return None
+    pm = pointmap
+    if pm.dim() == 3:
+        if pm.shape[0] == 3:
+            return pm.unsqueeze(0)
+        if pm.shape[-1] == 3:
+            return pm.permute(2, 0, 1).unsqueeze(0)
+        return None
+    if pm.dim() == 4:
+        if pm.shape[1] == 3:
+            return pm
+        if pm.shape[-1] == 3:
+            return pm.permute(0, 3, 1, 2)
+        return None
+    return None
+
+
+def _fit_plane_ls(u: torch.Tensor, v: torch.Tensor, y: torch.Tensor) -> Optional[torch.Tensor]:
+    if u.numel() < 3 or v.numel() < 3 or y.numel() < 3:
+        return None
+    A = torch.stack([u, v, torch.ones_like(u)], dim=1)  # [N,3]
+    b = y.unsqueeze(1)  # [N,1]
+    try:
+        sol = torch.linalg.lstsq(A, b).solution  # [3,1]
+        if sol.numel() >= 3:
+            return sol[:3, 0]
+    except Exception:
+        pass
+    try:
+        pinv = torch.linalg.pinv(A)
+        sol2 = (pinv @ b).squeeze(1)
+        if sol2.numel() >= 3:
+            return sol2[:3]
+    except Exception:
+        pass
+    return None
+
+
+def drop_ground_from_fg_plane(
+    fg_mask: Optional[torch.Tensor],
+    valid_mask: Optional[torch.Tensor],
+    pointmap: Optional[torch.Tensor],
+    out_hw: Tuple[int, int],
+    axis: int = 1,
+    margin: float = 0.05,
+    min_points: int = 256,
+    seed_q: float = 0.20,
+    inlier_q: float = 0.70,
+    refine_iters: int = 2,
+    fallback_q: float = 0.05,
+) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
+    """
+    Remove likely ground from fg_mask using a robust plane fit on pointmap:
+    1) seed by low-height quantile
+    2) least-squares fit plane y = a*u + b*v + c
+    3) iterative residual inlier refinement
+    """
+    info: Dict[str, Any] = {
+        "applied": False,
+        "method": "plane",
+        "fallback": [],
+        "floor_vals": [],
+        "coeffs": [],
+        "num_points": [],
+        "num_inliers": [],
+    }
+    if fg_mask is None:
+        return fg_mask, info
+    pm = _as_pointmap_b3hw(pointmap)
+    if pm is None:
+        return fg_mask, info
+
+    fg = ensure_4d(fg_mask).float()
+    vm = ensure_4d(valid_mask).float() if valid_mask is not None else None
+    if fg is None:
+        return fg_mask, info
+    if pm.shape[0] == 1 and fg.shape[0] > 1:
+        pm = pm.expand(fg.shape[0], -1, -1, -1)
+    if vm is not None and vm.shape[0] == 1 and fg.shape[0] > 1:
+        vm = vm.expand(fg.shape[0], -1, -1, -1)
+    if pm.shape[0] != fg.shape[0]:
+        return fg_mask, info
+    if vm is not None and vm.shape[0] != fg.shape[0]:
+        return fg_mask, info
+
+    ax = int(axis)
+    if ax < 0:
+        ax = 3 + ax
+    if ax < 0 or ax > 2:
+        return fg_mask, info
+
+    if pm.shape[-2:] != tuple(out_hw):
+        pm = F.interpolate(pm.float(), size=out_hw, mode="bilinear", align_corners=False)
+    else:
+        pm = pm.float()
+
+    keep_axes: List[int] = [0, 1, 2]
+    keep_axes.remove(ax)
+    u_all = pm[:, keep_axes[0]:keep_axes[0] + 1, :, :]
+    v_all = pm[:, keep_axes[1]:keep_axes[1] + 1, :, :]
+    y_all = pm[:, ax:ax + 1, :, :]
+
+    out = fg.clone()
+    B = int(out.shape[0])
+    for b in range(B):
+        mb = (fg[b:b + 1] > 0.5)
+        if vm is not None:
+            mb = mb & (vm[b:b + 1] > 0.5)
+        mb2 = mb[0, 0]
+        n_pts = int(mb2.sum().item())
+        info["num_points"].append(n_pts)
+        if n_pts < int(min_points):
+            info["fallback"].append(True)
+            info["coeffs"].append(None)
+            info["num_inliers"].append(0)
+            yb = y_all[b, 0][mb2]
+            floor = _safe_quantile(yb, float(fallback_q))
+            floor_v = float(floor.item()) if floor is not None else float("nan")
+            info["floor_vals"].append(floor_v)
+            if floor is not None:
+                keep = (y_all[b, 0] > (floor + float(margin))).float()
+                out[b, 0] = out[b, 0] * keep
+            continue
+
+        ub = u_all[b, 0][mb2]
+        vb = v_all[b, 0][mb2]
+        yb = y_all[b, 0][mb2]
+
+        y_seed_thr = _safe_quantile(yb, float(seed_q))
+        if y_seed_thr is not None:
+            seed_mask = (yb <= y_seed_thr)
+            if int(seed_mask.sum().item()) >= max(32, int(min_points) // 4):
+                fit_u = ub[seed_mask]
+                fit_v = vb[seed_mask]
+                fit_y = yb[seed_mask]
+            else:
+                fit_u, fit_v, fit_y = ub, vb, yb
+        else:
+            fit_u, fit_v, fit_y = ub, vb, yb
+
+        coeff = _fit_plane_ls(fit_u, fit_v, fit_y)
+        if coeff is None:
+            info["fallback"].append(True)
+            info["coeffs"].append(None)
+            info["num_inliers"].append(0)
+            floor = _safe_quantile(yb, float(fallback_q))
+            floor_v = float(floor.item()) if floor is not None else float("nan")
+            info["floor_vals"].append(floor_v)
+            if floor is not None:
+                keep = (y_all[b, 0] > (floor + float(margin))).float()
+                out[b, 0] = out[b, 0] * keep
+            continue
+
+        inliers = torch.ones_like(yb, dtype=torch.bool)
+        for _ in range(max(0, int(refine_iters))):
+            a, bb, c = coeff
+            y_hat = a * ub + bb * vb + c
+            resid = (yb - y_hat).abs()
+            thr = _safe_quantile(resid, float(inlier_q))
+            if thr is None:
+                break
+            inliers = resid <= thr
+            if int(inliers.sum().item()) < max(32, int(min_points) // 4):
+                break
+            coeff_new = _fit_plane_ls(ub[inliers], vb[inliers], yb[inliers])
+            if coeff_new is None:
+                break
+            coeff = coeff_new
+
+        a, bb, c = coeff
+        y_plane = a * u_all[b, 0] + bb * v_all[b, 0] + c
+        keep = (y_all[b, 0] > (y_plane + float(margin))).float()
+        out[b, 0] = out[b, 0] * keep
+
+        floor_on_fg = y_plane[mb2]
+        floor_ref = _safe_quantile(floor_on_fg, 0.5)
+        info["fallback"].append(False)
+        info["coeffs"].append([float(a.item()), float(bb.item()), float(c.item())])
+        info["num_inliers"].append(int(inliers.sum().item()))
+        info["floor_vals"].append(
+            float(floor_ref.item()) if floor_ref is not None else float("nan"))
+
+    info["applied"] = True
+    if fg_mask.dim() == 2:
+        return out[0, 0], info
+    if fg_mask.dim() == 3:
+        return out[0], info
+    return out, info
 
 
 def mask_dilation(mask01: torch.Tensor, k: int = 5) -> torch.Tensor:

@@ -8,6 +8,7 @@ import json
 import argparse
 import configparser
 import re
+import random
 import subprocess
 from datetime import datetime
 from typing import Dict, Any, Tuple, Optional, List
@@ -38,7 +39,11 @@ except Exception:
 
 from view_decoder_ablation import GeomViewDecoderAblation
 from zju_dataset_view import ZJUViewSynthDataset
-from mask_ops import mask_stats as _mask_stats
+from mask_ops import (
+    mask_stats as _mask_stats,
+    smooth_confidence_map,
+    drop_ground_from_fg_plane,
+)
 from view_decoder_losses import (
     masked_charbonnier,
     masked_huber,
@@ -468,7 +473,7 @@ def _safe_quantile(x: torch.Tensor, q: float) -> Optional[torch.Tensor]:
         return flat.kthvalue(k + 1).values
 
 
-def drop_ground_from_fg(
+def drop_ground_from_fg_quantile(
     fg_mask: torch.Tensor,
     valid_mask: Optional[torch.Tensor],
     pointmap: Optional[torch.Tensor],
@@ -1175,10 +1180,11 @@ def build_masks_from_batch(
     train_min_cover: float = 0.10,
     fg_thr: float = 0.5,
     fg_min_cover: float = 0.05,
-    fg_dilate_k: int = 7,
+    fg_dilate_k: int = 5,
     fg_keep_largest_cc: bool = True,
     fg_lcc_min_pixels: int = 32,
     fg_drop_ground: Optional[bool] = None,
+    fg_ground_method: Optional[str] = None,
     fg_ground_axis: Optional[int] = None,
     fg_ground_q: Optional[float] = None,
     fg_ground_margin: Optional[float] = None,
@@ -1193,6 +1199,8 @@ def build_masks_from_batch(
     conf_use_quantile: bool = True,
     conf_qlo: float = 0.05,
     conf_qhi: float = 0.95,
+    conf_smooth_k: Optional[int] = None,
+    conf_smooth_passes: Optional[int] = None,
     use_conf_in_train_mask: bool = True,
     train_mask_mode: Optional[str] = None,
     pred_conf_gate: Optional[torch.Tensor] = None,
@@ -1316,10 +1324,15 @@ def build_masks_from_batch(
     # optional: remove ground using pointmap height quantile
     source_pointmap_key = None
     drop_ground = bool(_resolve_opt(fg_drop_ground, "fg_drop_ground", False))
+    fg_ground_method_v = str(_resolve_opt(fg_ground_method, "fg_ground_method", "plane")).strip().lower()
+    if fg_ground_method_v not in ("plane", "quantile"):
+        fg_ground_method_v = "plane"
     fg_ground_axis_v = int(_resolve_opt(fg_ground_axis, "fg_ground_axis", 1))
     fg_ground_q_v = float(_resolve_opt(fg_ground_q, "fg_ground_q", 0.05))
-    fg_ground_margin_v = float(_resolve_opt(fg_ground_margin, "fg_ground_margin", 0.02))
-    fg_ground_min_points_v = int(_resolve_opt(fg_ground_min_points, "fg_ground_min_points", 64))
+    fg_ground_margin_v = float(_resolve_opt(fg_ground_margin, "fg_ground_margin", 0.05))
+    fg_ground_min_points_v = int(_resolve_opt(fg_ground_min_points, "fg_ground_min_points", 256))
+    conf_smooth_k_v = int(_resolve_opt(conf_smooth_k, "conf_smooth_k", 3))
+    conf_smooth_passes_v = int(_resolve_opt(conf_smooth_passes, "conf_smooth_passes", 1))
     ground_info = None
     if drop_ground:
         pm_key, tgt_pointmap = pick_first_tensor(
@@ -1327,16 +1340,28 @@ def build_masks_from_batch(
         )
         source_pointmap_key = pm_key
         if tgt_pointmap is not None:
-            fg_mask0, ground_info = drop_ground_from_fg(
-                fg_mask0,
-                valid_mask,
-                tgt_pointmap.to(device),
-                out_hw=(H, W),
-                axis=fg_ground_axis_v,
-                q=fg_ground_q_v,
-                margin=fg_ground_margin_v,
-                min_points=fg_ground_min_points_v,
-            )
+            if fg_ground_method_v == "plane":
+                fg_mask0, ground_info = drop_ground_from_fg_plane(
+                    fg_mask0,
+                    valid_mask,
+                    tgt_pointmap.to(device),
+                    out_hw=(H, W),
+                    axis=fg_ground_axis_v,
+                    margin=fg_ground_margin_v,
+                    min_points=fg_ground_min_points_v,
+                    fallback_q=fg_ground_q_v,
+                )
+            else:
+                fg_mask0, ground_info = drop_ground_from_fg_quantile(
+                    fg_mask0,
+                    valid_mask,
+                    tgt_pointmap.to(device),
+                    out_hw=(H, W),
+                    axis=fg_ground_axis_v,
+                    q=fg_ground_q_v,
+                    margin=fg_ground_margin_v,
+                    min_points=fg_ground_min_points_v,
+                )
         else:
             ground_info = {"applied": False, "floor_vals": []}
 
@@ -1449,6 +1474,12 @@ def build_masks_from_batch(
         if conf_mask.shape[-2:] != (H, W):
             conf_mask = F.interpolate(conf_mask, size=(H, W), mode="bilinear", align_corners=False)
         conf_mask = conf_mask.clamp(0.0, 1.0)
+        if conf_smooth_k_v > 1 and conf_smooth_passes_v > 0:
+            conf_mask = smooth_confidence_map(
+                conf_mask,
+                kernel_size=conf_smooth_k_v,
+                passes=conf_smooth_passes_v,
+            )
         if conf_weight_detach:
             conf_mask = conf_mask.detach()
         if float(conf_gate_floor) > 0:
@@ -1497,6 +1528,12 @@ def build_masks_from_batch(
     # gate_conf expected in [0,1]; clamp/gamma/soft-floor + strength if configured
     if use_conf_gate:
         gate_conf = gate_conf.clamp(0.0, 1.0)
+        if conf_smooth_k_v > 1 and conf_smooth_passes_v > 0:
+            gate_conf = smooth_confidence_map(
+                gate_conf,
+                kernel_size=conf_smooth_k_v,
+                passes=conf_smooth_passes_v,
+            )
         if abs(conf_gate_gamma - 1.0) > 1e-6:
             gate_conf = gate_conf.pow(conf_gate_gamma)
         if recon_gate_floor > 0.0:
@@ -1524,6 +1561,12 @@ def build_masks_from_batch(
         if conf_weight_map.shape[-2:] != recon_base.shape[-2:]:
             conf_weight_map = F.interpolate(
                 conf_weight_map, size=recon_base.shape[-2:], mode="nearest")
+        if conf_smooth_k_v > 1 and conf_smooth_passes_v > 0:
+            conf_weight_map = smooth_confidence_map(
+                conf_weight_map,
+                kernel_size=conf_smooth_k_v,
+                passes=conf_smooth_passes_v,
+            )
         if conf_weight_min > 0.0:
             conf_weight_map = conf_weight_min + \
                 (1.0 - conf_weight_min) * conf_weight_map
@@ -1560,6 +1603,8 @@ def build_masks_from_batch(
         "conf_gate_gamma": float(conf_gate_gamma),
         "conf_gate_strength": float(conf_gate_strength),
         "conf_weight_strength": float(conf_weight_strength),
+        "conf_smooth_k": int(conf_smooth_k_v),
+        "conf_smooth_passes": int(conf_smooth_passes_v),
         "conf_weight_min": float(conf_weight_min)
         if conf_weight_min is not None else None,
         "recon_gate_floor": float(recon_gate_floor),
@@ -1582,6 +1627,7 @@ def build_masks_from_batch(
         "source_pointmap_key": source_pointmap_key,
         "fg_drop_ground": bool(drop_ground),
         "fg_ground_axis": int(fg_ground_axis_v),
+        "fg_ground_method": str(fg_ground_method_v),
         "fg_ground_q": float(fg_ground_q_v),
         "fg_ground_margin": float(fg_ground_margin_v),
         "fg_ground_min_points": int(fg_ground_min_points_v),
@@ -2081,6 +2127,136 @@ def save_checkpoint(path: str, payload: dict):
     torch.save(payload, path)
 
 
+def _checkpoint_name_priority(path: Path) -> int:
+    name = path.name.lower()
+    has_ema = ("ema" in name)
+    has_last = ("last" in name)
+    has_best = ("best" in name)
+    if has_ema and has_last:
+        score = 400
+    elif has_ema and has_best:
+        score = 350
+    elif has_ema:
+        score = 320
+    elif has_last:
+        score = 300
+    elif has_best:
+        score = 250
+    else:
+        score = 100
+    if "ablation" in name:
+        score += 10
+    return score
+
+
+def list_auto_resume_candidates(ckpt_dir: str) -> List[str]:
+    root = Path(str(ckpt_dir))
+    if (not root.exists()) or (not root.is_dir()):
+        return []
+    exts = {".pth", ".pt", ".ckpt"}
+    paths = [p for p in root.rglob("*")
+             if p.is_file() and p.suffix.lower() in exts]
+    paths.sort(
+        key=lambda p: (_checkpoint_name_priority(p), p.stat().st_mtime),
+        reverse=True,
+    )
+    return [str(p) for p in paths]
+
+
+def resolve_resume_candidates(resume: str, ckpt_dir: str) -> Tuple[List[str], bool]:
+    r = (resume or "").strip()
+    is_auto = (r == "") or (r.lower() == "auto")
+    if not is_auto:
+        return [r], False
+    return list_auto_resume_candidates(ckpt_dir), True
+
+
+def capture_rng_state() -> Dict[str, Any]:
+    state: Dict[str, Any] = {}
+    try:
+        state["python"] = random.getstate()
+    except Exception:
+        pass
+    try:
+        state["numpy"] = np.random.get_state()
+    except Exception:
+        pass
+    try:
+        state["torch"] = torch.get_rng_state()
+    except Exception:
+        pass
+    if torch.cuda.is_available():
+        try:
+            state["torch_cuda"] = torch.cuda.get_rng_state_all()
+        except Exception:
+            pass
+    return state
+
+
+def restore_rng_state(state: Any) -> bool:
+    if not isinstance(state, dict):
+        return False
+    restored = False
+    py_state = state.get("python", None)
+    if py_state is not None:
+        try:
+            random.setstate(py_state)
+            restored = True
+        except Exception:
+            pass
+    np_state = state.get("numpy", None)
+    if np_state is not None:
+        try:
+            np.random.set_state(np_state)
+            restored = True
+        except Exception:
+            pass
+    torch_state = state.get("torch", None)
+    if torch_state is not None:
+        try:
+            torch.set_rng_state(torch_state)
+            restored = True
+        except Exception:
+            pass
+    cuda_state = state.get("torch_cuda", None)
+    if cuda_state is not None and torch.cuda.is_available():
+        try:
+            torch.cuda.set_rng_state_all(cuda_state)
+            restored = True
+        except Exception:
+            pass
+    return restored
+
+
+def align_cosine_scheduler_to_global_step(
+    scheduler: Optional[torch.optim.lr_scheduler.LambdaLR],
+    optimizer: torch.optim.Optimizer,
+    global_step: int,
+) -> bool:
+    if scheduler is None:
+        return False
+    if not isinstance(scheduler, torch.optim.lr_scheduler.LambdaLR):
+        return False
+
+    # Keep LR in sync with resumed optimizer-step count.
+    # For current torch LambdaLR behavior, scheduler starts at last_epoch=0.
+    target_last_epoch = max(0, int(global_step))
+
+    lrs: List[float] = []
+    try:
+        for i, pg in enumerate(optimizer.param_groups):
+            base_lr = float(scheduler.base_lrs[i])
+            fn = scheduler.lr_lambdas[i]
+            mult = float(fn(target_last_epoch))
+            pg["lr"] = base_lr * mult
+            lrs.append(float(pg["lr"]))
+        scheduler.last_epoch = target_last_epoch
+        scheduler._last_lr = lrs  # type: ignore[attr-defined]
+        return True
+    except Exception:
+        return False
+
+
 # ---------------------------
 # LR schedule: Warmup + Cosine (step-based)
 # ---------------------------
@@ -2192,7 +2368,7 @@ def parse_args():
     p.add_argument("--num_workers_train", type=int, default=8)
     p.add_argument("--num_workers_val", type=int, default=4)
 
-    p.add_argument("--epochs", type=int, default=130)
+    p.add_argument("--epochs", type=int, default=150)
     p.add_argument("--lr", type=float, default=5e-5)
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--conf_head_lr_mult", type=float, default=2.0,
@@ -2239,7 +2415,8 @@ def parse_args():
     p.add_argument("--no_report_bad_samples", dest="report_bad_samples",
                    action="store_false")
 
-    p.add_argument("--resume", type=str, default="", help="ckpt path")
+    p.add_argument("--resume", type=str, default="",
+                   help="Checkpoint path. Use empty/auto to auto-pick latest ckpt from ckpt_dir.")
     p.add_argument("--log_dir", type=str, default="debug_viewdec_ablation")
     p.add_argument("--ckpt_dir", type=str, default="ckpt")
 
@@ -2381,7 +2558,7 @@ def parse_args():
                    help="TV loss on pred_conf to suppress salt-pepper")
     p.add_argument("--lambda_ssim", type=float, default=0.0,
                    help="(optional) add 1-SSIM loss, usually keep 0 or tiny")
-    p.add_argument("--lambda_conf_mean", type=float, default=0.0,
+    p.add_argument("--lambda_conf_mean", type=float, default=1e-3,
                    help="Mean-conf regularizer weight (anti-gaming)")
     p.add_argument("--conf_mean_target", type=float, default=0.5,
                    help="Target mean for conf regularizer")
@@ -2439,21 +2616,24 @@ def parse_args():
     p.add_argument("--train_min_cover", type=float, default=0.10)
     p.add_argument("--fg_thr", type=float, default=0.5)
     p.add_argument("--fg_min_cover", type=float, default=0.05)
-    p.add_argument("--fg_dilate_k", type=int, default=7)
+    p.add_argument("--fg_dilate_k", type=int, default=5)
     p.add_argument("--fg_keep_largest_cc", type=int, default=1, choices=[0, 1])
     p.add_argument("--fg_lcc_min_pixels", type=int, default=32)
     p.add_argument("--fg_drop_ground", dest="fg_drop_ground",
-                   action="store_true", help="Remove ground from fg mask using pointmap height quantile")
+                   action="store_true", help="Remove ground-like region from fg mask using pointmap")
     p.add_argument("--no_fg_drop_ground", dest="fg_drop_ground",
                    action="store_false", help="Disable pointmap ground removal for fg mask")
     p.set_defaults(fg_drop_ground=True)
+    p.add_argument("--fg_ground_method", type=str, default="plane",
+                   choices=["plane", "quantile"],
+                   help="Ground removal method: robust plane fit or quantile threshold.")
     p.add_argument("--fg_ground_axis", type=int, default=1,
                    help="Vertical axis index in pointmap (0=x,1=y,2=z)")
     p.add_argument("--fg_ground_q", type=float, default=0.05,
                    help="Ground height quantile within fg&valid region")
-    p.add_argument("--fg_ground_margin", type=float, default=0.02,
+    p.add_argument("--fg_ground_margin", type=float, default=0.05,
                    help="Margin above ground height to keep (same units as pointmap)")
-    p.add_argument("--fg_ground_min_points", type=int, default=64,
+    p.add_argument("--fg_ground_min_points", type=int, default=256,
                    help="Min fg points to estimate ground height per sample")
     p.add_argument("--valid_min_cover", type=float, default=0.10)
     p.add_argument("--valid_dilate_k", type=int, default=7)
@@ -2476,6 +2656,10 @@ def parse_args():
                    action="store_false", help="Disable quantile scaling for confidence")
     p.add_argument("--conf_qlo", type=float, default=0.05)
     p.add_argument("--conf_qhi", type=float, default=0.95)
+    p.add_argument("--conf_smooth_k", type=int, default=3,
+                   help="Kernel size for confidence smoothing before gate/weight (<=1 disables).")
+    p.add_argument("--conf_smooth_passes", type=int, default=1,
+                   help="How many smoothing passes on confidence maps.")
 
     p.add_argument("--conf_sup_use_quantile", action="store_true", default=False,
                    help="conf supervision 用 quantile 归一化（默认关，避免每 batch 抖动）")
@@ -2648,6 +2832,8 @@ def main():
         "conf_use_quantile(mask)": args.conf_use_quantile,
         "conf_qlo": args.conf_qlo,
         "conf_qhi": args.conf_qhi,
+        "conf_smooth_k": args.conf_smooth_k,
+        "conf_smooth_passes": args.conf_smooth_passes,
         "conf_sup_use_quantile": args.conf_sup_use_quantile,
         "conf_sup_gamma": args.conf_sup_gamma,
         "train_mask_mode": args.train_mask_mode,
@@ -2667,6 +2853,7 @@ def main():
         "holdout_view_ids": ",".join(str(v) for v in holdout_view_ids),
         "holdout_view_names": ",".join(holdout_view_names),
         "fg_drop_ground": args.fg_drop_ground,
+        "fg_ground_method": args.fg_ground_method,
         "fg_ground_axis": args.fg_ground_axis,
         "fg_ground_q": args.fg_ground_q,
         "fg_ground_margin": args.fg_ground_margin,
@@ -2997,40 +3184,82 @@ def main():
     # ---------------------------
     # Resume
     # ---------------------------
-    if args.resume and os.path.isfile(args.resume):
-        ck = load_checkpoint(args.resume, device=device)
-        if "model" in ck and isinstance(ck["model"], dict):
-            missing, unexpected = model.load_state_dict(
-                ck["model"], strict=False)
+    resume_ema_loaded = False
+    resume_scheduler_loaded = False
+    resume_path = None
+    resume_candidates, resume_is_auto = resolve_resume_candidates(
+        args.resume, args.ckpt_dir)
+    if resume_is_auto:
+        if resume_candidates:
             print(
-                f"[info] resumed model from {args.resume} (strict=False). missing={len(missing)} unexpected={len(unexpected)}")
-        if args.use_ema and ema_model is not None and "ema" in ck and isinstance(ck["ema"], dict):
-            ema_model.load_state_dict(ck["ema"], strict=False)
-            print("[info] resumed ema.")
+                f"[info] auto-resume candidates found: {len(resume_candidates)} "
+                f"(top={resume_candidates[0]})"
+            )
+        else:
+            print(
+                f"[info] auto-resume: no checkpoint found under ckpt_dir={args.ckpt_dir}; start fresh."
+            )
+    elif resume_candidates and (not os.path.isfile(resume_candidates[0])):
+        print(f"[warn] resume path not found: {resume_candidates[0]}")
+        resume_candidates = []
+
+    ck = None
+    for cand in resume_candidates:
+        if not os.path.isfile(cand):
+            continue
+        try:
+            ck = load_checkpoint(cand, device=device)
+            resume_path = cand
+            break
+        except Exception as e:
+            print(f"[warn] failed to load checkpoint {cand}: {e}")
+
+    if ck is not None and resume_path is not None:
+        args.resume = resume_path
+        model_state = ck.get("model", None)
+        if isinstance(model_state, dict):
+            missing, unexpected = model.load_state_dict(
+                model_state, strict=False)
+            print(
+                f"[info] resumed model from {resume_path} (strict=False). missing={len(missing)} unexpected={len(unexpected)}")
+        else:
+            print(f"[warn] checkpoint has no model state: {resume_path}")
+
+        if args.use_ema and ema_model is not None:
+            ema_state = ck.get("ema", None)
+            if isinstance(ema_state, dict):
+                ema_model.load_state_dict(ema_state, strict=False)
+                resume_ema_loaded = True
+                print("[info] resumed ema from checkpoint.")
+
         skip_optim_resume = bool(args.finetune_view_only) or bool(args.reset_optim)
         if skip_optim_resume:
             reason = "finetune_view_only=1" if args.finetune_view_only else "reset_optim=1"
             print(
                 f"[info] {reason} => skip optimizer/scheduler/scaler resume.")
         if not skip_optim_resume:
-            if "optimizer" in ck:
+            optim_state = ck.get("optimizer", ck.get("optim", None))
+            if optim_state is not None:
                 try:
-                    optimizer.load_state_dict(ck["optimizer"])
+                    optimizer.load_state_dict(optim_state)
                     print("[info] resumed optimizer.")
                 except Exception as e:
                     print(f"[warn] resume optimizer failed: {e}")
-            if "scaler" in ck:
+            scaler_state = ck.get("scaler", None)
+            if scaler_state is not None:
                 try:
-                    scaler.load_state_dict(ck["scaler"])
+                    scaler.load_state_dict(scaler_state)
                     print("[info] resumed scaler.")
                 except Exception as e:
                     print(f"[warn] resume scaler failed: {e}")
-            if "scheduler" in ck and args.lr_schedule == "cosine":
+            if args.lr_schedule == "cosine" and ("scheduler" in ck) and (ck.get("scheduler", None) is not None):
                 try:
                     scheduler.load_state_dict(ck["scheduler"])
+                    resume_scheduler_loaded = True
                     print("[info] resumed scheduler.")
                 except Exception as e:
                     print(f"[warn] resume scheduler failed: {e}")
+
         if args.finetune_view_only:
             print(
                 "[info] finetune_view_only=1 => reset epoch/global_step/best_val/no_improve.")
@@ -3040,27 +3269,53 @@ def main():
             epochs_no_improve = 0
         else:
             start_epoch = int(ck.get("epoch", 0))
-            global_step = int(ck.get("global_step", 0))
+            global_step = int(ck.get("global_step", ck.get("step", 0)))
             ck_best_by = ck.get("best_by", None)
             if ck_best_by is not None and str(ck_best_by) != str(args.best_by):
                 print(
                     f"[warn] best_by changed ({ck_best_by} -> {args.best_by}); reset best_val.")
                 best_val = _best_init(args.best_by)
             else:
-                best_val = float(ck.get("best_val", best_val))
+                best_val = float(
+                    ck.get("best_val", ck.get("best_metric_value", best_val))
+                )
             epochs_no_improve = int(ck.get("epochs_no_improve", 0))
             print(
                 f"[info] resume meta: epoch={start_epoch} global_step={global_step} best_val={best_val:.6f} no_improve={epochs_no_improve}")
 
+            if restore_rng_state(ck.get("rng_state", None)):
+                print("[info] restored rng_state from checkpoint.")
+
+            if args.lr_schedule == "cosine":
+                aligned = align_cosine_scheduler_to_global_step(
+                    scheduler, optimizer, global_step)
+                if aligned:
+                    lr0 = float(optimizer.param_groups[0]["lr"])
+                    print(
+                        f"[info] aligned cosine scheduler by global_step={global_step} (lr={lr0:.6g}, loaded_state={resume_scheduler_loaded})")
+
     ema_start_step = int(args.ema_start_step)
-    if args.use_ema and ema_model is not None and ema_start_step > 0:
-        ema_started = (global_step >= ema_start_step)
-        print(
-            f"[info] EMA start_step={ema_start_step} hardcopy={bool(args.ema_start_hardcopy)} "
-            f"(started={ema_started})"
-        )
+    if args.use_ema and ema_model is not None:
+        if resume_ema_loaded:
+            ema_started = True
+            print(
+                "[info] EMA state came from checkpoint; skip EMA start hard-copy on resume.")
+        elif ema_start_step > 0:
+            ema_started = (global_step >= ema_start_step)
+            print(
+                f"[info] EMA start_step={ema_start_step} hardcopy={bool(args.ema_start_hardcopy)} "
+                f"(started={ema_started})"
+            )
+        else:
+            ema_started = True
     else:
         ema_started = True
+
+    try:
+        with open(os.path.join(args.log_dir, "args.json"), "w", encoding="utf-8") as f:
+            json.dump(vars(args), f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
     def run_val(
         eval_model: nn.Module,
@@ -3146,6 +3401,7 @@ def main():
                         fg_keep_largest_cc=args.fg_keep_largest_cc,
                         fg_lcc_min_pixels=args.fg_lcc_min_pixels,
                         fg_drop_ground=args.fg_drop_ground,
+                        fg_ground_method=args.fg_ground_method,
                         fg_ground_axis=args.fg_ground_axis,
                         fg_ground_q=args.fg_ground_q,
                         fg_ground_margin=args.fg_ground_margin,
@@ -3160,6 +3416,8 @@ def main():
                         conf_use_quantile=args.conf_use_quantile,
                         conf_qlo=args.conf_qlo,
                         conf_qhi=args.conf_qhi,
+                        conf_smooth_k=args.conf_smooth_k,
+                        conf_smooth_passes=args.conf_smooth_passes,
                         use_conf_in_train_mask=args.use_conf_loss_gate,
                         train_mask_mode=args.train_mask_mode,
                         pred_conf_gate=pred_conf,
@@ -3430,6 +3688,7 @@ def main():
                 fg_keep_largest_cc=args.fg_keep_largest_cc,
                 fg_lcc_min_pixels=args.fg_lcc_min_pixels,
                 fg_drop_ground=args.fg_drop_ground,
+                fg_ground_method=args.fg_ground_method,
                 fg_ground_axis=args.fg_ground_axis,
                 fg_ground_q=args.fg_ground_q,
                 fg_ground_margin=args.fg_ground_margin,
@@ -3444,6 +3703,8 @@ def main():
                 conf_use_quantile=args.conf_use_quantile,
                 conf_qlo=args.conf_qlo,
                 conf_qhi=args.conf_qhi,
+                conf_smooth_k=args.conf_smooth_k,
+                conf_smooth_passes=args.conf_smooth_passes,
                 use_conf_in_train_mask=args.use_conf_loss_gate,
                 train_mask_mode=args.train_mask_mode,
                 pred_conf_gate=pred_conf_dbg,
@@ -3597,6 +3858,7 @@ def main():
                     fg_keep_largest_cc=args.fg_keep_largest_cc,
                     fg_lcc_min_pixels=args.fg_lcc_min_pixels,
                     fg_drop_ground=args.fg_drop_ground,
+                    fg_ground_method=args.fg_ground_method,
                     fg_ground_axis=args.fg_ground_axis,
                     fg_ground_q=args.fg_ground_q,
                     fg_ground_margin=args.fg_ground_margin,
@@ -3611,6 +3873,8 @@ def main():
                     conf_use_quantile=args.conf_use_quantile,
                     conf_qlo=args.conf_qlo,
                     conf_qhi=args.conf_qhi,
+                    conf_smooth_k=args.conf_smooth_k,
+                    conf_smooth_passes=args.conf_smooth_passes,
                     use_conf_in_train_mask=args.use_conf_loss_gate,
                     train_mask_mode=args.train_mask_mode,
                     pred_conf_gate=pred_conf,
@@ -4239,22 +4503,24 @@ def main():
             "model": model.state_dict(),
             "ema": (ema_model.state_dict() if (args.use_ema and ema_model is not None) else None),
             "optimizer": optimizer.state_dict(),
+            "optim": optimizer.state_dict(),
             "scaler": scaler.state_dict(),
-            "scheduler": (scheduler.state_dict() if args.lr_schedule == "cosine" else None),
+            "scheduler": (scheduler.state_dict() if scheduler is not None else None),
             "epoch": epoch + 1,
             "global_step": global_step,
+            "step": global_step,
             "best_val": best_val,
             "val_raw": raw_val,
             "val_ema": ema_val,
             "best_by": args.best_by,
             "best_metric": metric_name,
+            "best_metric_value": float(best_val),
+            "metric_val": float(metric_val),
             "epochs_no_improve": epochs_no_improve,
+            "rng_state": capture_rng_state(),
             "args": vars(args),
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
-
-        ckpt_last = os.path.join(args.ckpt_dir, "viewdec_ablation_last.pth")
-        save_checkpoint(ckpt_last, payload)
 
         if higher_is_better:
             improved = (metric_val - best_val) > float(args.min_improve)
@@ -4266,6 +4532,7 @@ def main():
             ckpt_path = os.path.join(
                 args.ckpt_dir, f"viewdec_ablation_best_epoch{epoch:02d}.pth")
             payload["best_val"] = best_val
+            payload["best_metric_value"] = best_val
             payload["epochs_no_improve"] = epochs_no_improve
             save_checkpoint(ckpt_path, payload)
             save_checkpoint(os.path.join(
@@ -4274,7 +4541,15 @@ def main():
                 f" -> val improved ({metric_name}={metric_val:.6f}), saved new best: {ckpt_path}")
         else:
             epochs_no_improve += 1
+            payload["epochs_no_improve"] = epochs_no_improve
             print(f" -> val not improved (no_improve = {epochs_no_improve})")
+
+        # Always persist latest training state after best/epoch bookkeeping.
+        payload["best_val"] = best_val
+        payload["best_metric_value"] = float(best_val)
+        payload["epochs_no_improve"] = epochs_no_improve
+        ckpt_last = os.path.join(args.ckpt_dir, "viewdec_ablation_last.pth")
+        save_checkpoint(ckpt_last, payload)
 
         if args.early_stop and epochs_no_improve >= int(args.early_stop):
             print(

@@ -159,3 +159,7 @@ models/*
 *.bak_*
 *.bak-*
 *.bak.*
+
+infer_out/
+infer_vis/
+debug_vis/
