@@ -1350,6 +1350,11 @@ def build_masks_from_batch(
         fg_mask = fg_mask.clone()
         fg_mask[bad_tgt_masked] = 0
 
+    train_mask_mode = str(_resolve_opt(
+        train_mask_mode, "train_mask_mode", "fg_conf")).lower()
+    if train_mask_mode not in ("fg_conf", "valid_conf", "valid_only"):
+        train_mask_mode = "fg_conf"
+
     # --- conf gate (optional) ---
 
     use_conf_gate = bool(_resolve_opt(use_conf_gate, "use_conf_gate", False))
@@ -1403,6 +1408,12 @@ def build_masks_from_batch(
         recon_mask_mode = "fg"
 
     # ---- conf masks ----
+    conf_norm_mask = valid_mask
+    if train_mask_mode == "fg_conf":
+        conf_norm_mask = (valid_mask * (fg_mask > 0.5).float()).clamp(0.0, 1.0)
+        if float(conf_norm_mask.mean().item()) <= 1e-6:
+            conf_norm_mask = valid_mask
+
     conf_geom_soft, conf01_full, conf_info = make_soft_mask_from_conf(
         tgt_depth_conf.float(),
         out_hw=(H, W),
@@ -1414,7 +1425,7 @@ def build_masks_from_batch(
         conf_use_quantile=conf_use_quantile,
         conf_qlo=conf_qlo,
         conf_qhi=conf_qhi,
-        valid_mask=valid_mask,
+        valid_mask=conf_norm_mask,
     )
     conf_geom_soft = conf_geom_soft.clamp(0, 1) * valid_mask
 
@@ -1450,11 +1461,6 @@ def build_masks_from_batch(
         conf_mask_mode = "all_ones"
 
     # ---- train mask ----
-    train_mask_mode = str(_resolve_opt(
-        train_mask_mode, "train_mask_mode", "fg_conf")).lower()
-    if train_mask_mode not in ("fg_conf", "valid_conf", "valid_only"):
-        train_mask_mode = "fg_conf"
-
     if train_mask_mode == "valid_only":
         train_mask = valid_mask.clone()
         cover_train = float(train_mask.mean().item())
@@ -2423,7 +2429,7 @@ def parse_args():
     p.add_argument("--train_mask_mode", type=str, default="fg_conf",
                    choices=["fg_conf", "valid_conf", "valid_only"],
                    help="Train mask base: fg*conf, valid*conf, or valid only")
-    p.add_argument("--recon_mask_mode", type=str, default="valid",
+    p.add_argument("--recon_mask_mode", type=str, default="fg",
                    choices=["fg", "train", "valid"],
                    help="Recon-weight base mask: fg, train, or valid")
     p.add_argument("--log_mask_stats", dest="log_mask_stats", action="store_true", default=True,

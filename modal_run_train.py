@@ -160,6 +160,8 @@ class Cfg:
     warmup_steps: int = 400
     min_lr_ratio: float = 0.1
     bg_weight: float = 0.05
+    train_mask_mode: str = "fg_conf"
+    recon_mask_mode: str = "fg"
     conf_use_quantile_mask: bool = True
     conf_qlo: float = 0.05
     conf_qhi: float = 0.95
@@ -232,6 +234,8 @@ class Cfg:
             warmup_steps=_env_int("VGGT_WARMUP_STEPS", 400),
             min_lr_ratio=_env_float("VGGT_MIN_LR_RATIO", 0.1),
             bg_weight=_env_float("VGGT_BG_WEIGHT", 0.05),
+            train_mask_mode=_env("VGGT_TRAIN_MASK_MODE", "fg_conf"),
+            recon_mask_mode=_env("VGGT_RECON_MASK_MODE", "fg"),
             conf_use_quantile_mask=_env_bool(
                 "VGGT_CONF_USE_QUANTILE_MASK", True),
             conf_qlo=_env_float("VGGT_CONF_QLO", 0.05),
@@ -482,6 +486,8 @@ def _build_train_cmd(cfg: Cfg) -> list[str]:
             f"--yaw_axis_x={int(cfg.yaw_axis_x)}",
             f"--yaw_axis_z={int(cfg.yaw_axis_z)}",
             f"--yaw_center_mode={cfg.yaw_center_mode}",
+            f"--train_mask_mode={cfg.train_mask_mode}",
+            f"--recon_mask_mode={cfg.recon_mask_mode}",
             f"--mosaic_every_steps={int(cfg.mosaic_every_steps)}",
             f"--mosaic_num_targets={int(cfg.mosaic_num_targets)}",
             f"--mosaic_num_src_views={int(cfg.mosaic_num_src_views)}",

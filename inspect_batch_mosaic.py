@@ -181,6 +181,8 @@ def _overlay_reprojection(
     src_k_3x3: np.ndarray,
     src_t_3x4: np.ndarray,
     stride: int = 24,
+    select_mask01: Optional[np.ndarray] = None,
+    select_thr: float = 0.5,
 ) -> np.ndarray:
     h, w = rgb_u8.shape[:2]
     out = Image.fromarray(rgb_u8.copy())
@@ -190,6 +192,14 @@ def _overlay_reprojection(
     h0, w0, _ = tgt_pointmap_hw3.shape
     grid_v, grid_u = np.meshgrid(np.arange(h0), np.arange(w0), indexing="ij")
     take = ((grid_u % s) == 0) & ((grid_v % s) == 0)
+    if select_mask01 is not None:
+        sm = np.asarray(select_mask01, dtype=np.float32)
+        if sm.ndim == 3:
+            sm = sm[..., 0]
+        if sm.shape != (h0, w0):
+            sm_img = Image.fromarray((np.clip(sm, 0.0, 1.0) * 255.0).astype(np.uint8))
+            sm = np.array(sm_img.resize((w0, h0), Image.NEAREST), dtype=np.float32) / 255.0
+        take = take & (sm > float(select_thr))
     uu = u.reshape(h0, w0)[take]
     vv = v.reshape(h0, w0)[take]
     zz = z.reshape(h0, w0)[take]
@@ -281,6 +291,7 @@ def _make_target_block(
     tgt_rgb = _load_rgb_u8(tgt_path)
     tgt_mask = _load_mask01(_infer_mask_path(tgt_path), size_hw=tgt_rgb.shape[:2])
     tgt_overlay = _overlay_mask(tgt_rgb, tgt_mask)
+    tgt_reproj_mask = tgt_mask if float(tgt_mask.mean()) > 1e-4 else None
     tgt_pm = _to_pointmap_hw3(pointmap[int(tgt_idx)])
     tgt_k = _to_3x3_intrinsic(intrinsic[int(tgt_idx)])
     tgt_t = _to_3x4_extrinsic(extrinsic[int(tgt_idx)])[0]
@@ -308,6 +319,7 @@ def _make_target_block(
             src_k_3x3=src_k,
             src_t_3x4=src_t,
             stride=point_stride,
+            select_mask01=tgt_reproj_mask,
         )
         src_reproj = _fit_tile_u8(src_reproj, tile_hw)
         src_reproj = _label_tile(src_reproj, "tgt pointmap reproj")
