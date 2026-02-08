@@ -4,6 +4,7 @@ import json
 import time
 import shlex
 import subprocess
+from collections import deque
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 
@@ -19,6 +20,11 @@ def _env(key: str, default: str | None = None) -> str:
     if v is None:
         return "" if default is None else default
     return v
+
+
+def _env_is_set(key: str) -> bool:
+    v = os.environ.get(key)
+    return (v is not None) and (str(v).strip() != "")
 
 
 def _env_int(key: str, default: int) -> int:
@@ -120,6 +126,44 @@ def _resolve_local_code_dir() -> str:
     return str(cwd)
 
 
+def _apply_profile_defaults(cfg: "Cfg") -> "Cfg":
+    profile = _env("VGGT_PROFILE", "").strip().lower()
+    if not profile:
+        return cfg
+
+    if profile != "phase5_final":
+        print(
+            f"[local] [warn] unknown VGGT_PROFILE={profile!r}; ignore profile defaults")
+        return cfg
+
+    print("[local] apply profile defaults: VGGT_PROFILE=phase5_final")
+    if not _env_is_set("VGGT_MODE"):
+        cfg.mode = "infer"
+    if not _env_is_set("VGGT_SEQ_NAMES"):
+        cfg.seq_names = ["CoreView_390"]
+    if not _env_is_set("VGGT_GEOM_SUBDIR"):
+        cfg.geom_subdir = "vggt_geom_ft_20260208_044454"
+    if not _env_is_set("VGGT_INFER_CKPT"):
+        cfg.infer_ckpt = (
+            "/mnt/out/viewdec_ablation/"
+            "CoreView_390_20260208_110514/ckpt/viewdec_ablation_best.pth"
+        )
+    if not _env_is_set("VGGT_INFER_SPLIT"):
+        cfg.infer_split = "val"
+    if not _env_is_set("VGGT_INFER_USE_EMA"):
+        cfg.infer_use_ema = False
+    if not _env_is_set("VGGT_INFER_BATCH_SIZE"):
+        cfg.infer_batch_size = 8
+    if not _env_is_set("VGGT_INFER_NUM_WORKERS"):
+        cfg.infer_num_workers = 8
+    if not _env_is_set("VGGT_INFER_NUM_SAMPLES"):
+        cfg.infer_num_samples = -1
+    if not _env_is_set("VGGT_INFER_OUT_DIR"):
+        cfg.infer_out_dir = "/mnt/out/infer_viewdec/CoreView_390_phase5_final_release"
+
+    return cfg
+
+
 # --------------------------
 # Config
 # --------------------------
@@ -138,10 +182,20 @@ class Cfg:
     seq_names: list[str]
 
     # --- pipeline mode ---
-    mode: str = "train"  # "precompute" or "train"
+    mode: str = "train"  # "precompute", "train", or "infer"
     precompute_script: str = "precompute_zju_vggt_geom.py"
     # optional; if set, will be copied to {mnt_code}/model.pt if needed
     precompute_ckpt: str = ""
+    infer_script: str = "infer_view_decoder_ablation.py"
+    infer_ckpt: str = ""
+    infer_split: str = "val"
+    infer_out_dir: str = ""
+    infer_num_samples: int = -1
+    infer_batch_size: int = 8
+    infer_num_workers: int = 8
+    infer_use_ema: bool = True
+    infer_args_extra: str = ""
+    geom_subdir: str = "vggt_geom"
     cam_names: list[str] = field(default_factory=list)
     max_frames: int = 0  # 0=all
 
@@ -162,6 +216,11 @@ class Cfg:
     bg_weight: float = 0.05
     train_mask_mode: str = "fg_conf"
     recon_mask_mode: str = "fg"
+    require_tgt_fg: bool = True
+    allow_fg_from_conf: bool = False
+    mask_cover_min: float = 0.01
+    mask_cover_max: float = 0.80
+    mask_sanity_mode: str = "warn"
     conf_use_quantile_mask: bool = True
     conf_qlo: float = 0.05
     conf_qhi: float = 0.95
@@ -186,6 +245,8 @@ class Cfg:
     mosaic_seed: int = 2026
     tf32: bool = True
     amp: bool = True
+    min_improve: float = 1e-4
+    early_stop: int = 0
 
     # volumes
     data_vol: str = "vggt-zju-data"
@@ -203,7 +264,7 @@ class Cfg:
         if not seq_names:
             raise RuntimeError("VGGT_SEQ_NAMES is empty")
 
-        return Cfg(
+        cfg = Cfg(
             # mounts
             code_dir=_resolve_local_code_dir(),
             mnt_code=_env("VGGT_MNT_CODE", "/mnt/code"),
@@ -217,6 +278,17 @@ class Cfg:
                 "VGGT_PRECOMPUTE_SCRIPT", "precompute_zju_vggt_geom.py").strip()
             or "precompute_zju_vggt_geom.py",
             precompute_ckpt=_env("VGGT_PRECOMPUTE_CKPT", "").strip(),
+            infer_script=_env("VGGT_INFER_SCRIPT",
+                              "infer_view_decoder_ablation.py"),
+            infer_ckpt=_env("VGGT_INFER_CKPT", "").strip(),
+            infer_split=(_env("VGGT_INFER_SPLIT", "val").strip() or "val"),
+            infer_out_dir=_env("VGGT_INFER_OUT_DIR", "").strip(),
+            infer_num_samples=_env_int("VGGT_INFER_NUM_SAMPLES", -1),
+            infer_batch_size=_env_int("VGGT_INFER_BATCH_SIZE", 8),
+            infer_num_workers=_env_int("VGGT_INFER_NUM_WORKERS", 8),
+            infer_use_ema=_env_bool("VGGT_INFER_USE_EMA", True),
+            infer_args_extra=_env("VGGT_INFER_ARGS_EXTRA", ""),
+            geom_subdir=(_env("VGGT_GEOM_SUBDIR", "vggt_geom").strip() or "vggt_geom"),
             cam_names=_split_csv_list(_env("VGGT_CAM_NAMES", "")),
             max_frames=_env_int("VGGT_MAX_FRAMES", 0),
             # run
@@ -236,6 +308,11 @@ class Cfg:
             bg_weight=_env_float("VGGT_BG_WEIGHT", 0.05),
             train_mask_mode=_env("VGGT_TRAIN_MASK_MODE", "fg_conf"),
             recon_mask_mode=_env("VGGT_RECON_MASK_MODE", "fg"),
+            require_tgt_fg=_env_bool("VGGT_REQUIRE_TGT_FG", True),
+            allow_fg_from_conf=_env_bool("VGGT_ALLOW_FG_FROM_CONF", False),
+            mask_cover_min=_env_float("VGGT_MASK_COVER_MIN", 0.01),
+            mask_cover_max=_env_float("VGGT_MASK_COVER_MAX", 0.80),
+            mask_sanity_mode=(_env("VGGT_MASK_SANITY_MODE", "warn").strip().lower() or "warn"),
             conf_use_quantile_mask=_env_bool(
                 "VGGT_CONF_USE_QUANTILE_MASK", True),
             conf_qlo=_env_float("VGGT_CONF_QLO", 0.05),
@@ -262,6 +339,8 @@ class Cfg:
             mosaic_seed=_env_int("VGGT_MOSAIC_SEED", 2026),
             tf32=_env_bool("VGGT_TF32", True),
             amp=_env_bool("VGGT_AMP", True),
+            min_improve=_env_float("VGGT_MIN_IMPROVE", 1e-4),
+            early_stop=_env_int("VGGT_EARLY_STOP", 0),
             # volumes
             data_vol=_env("VGGT_DATA_VOL", "vggt-zju-data"),
             out_vol=_env("VGGT_OUT_VOL", "vggt-out"),
@@ -271,6 +350,7 @@ class Cfg:
             debug_fixed_batch=_env_bool("VGGT_DEBUG_FIXED_BATCH", False),
             debug_fixed_index=_env_int("VGGT_DEBUG_FIXED_INDEX", 0),
         )
+        return _apply_profile_defaults(cfg)
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -322,6 +402,7 @@ app = modal.App("vggt-zju-runner")
 def _run_cmd(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
     print("[remote] $", " ".join(cmd))
     t0 = time.time()
+    tail = deque(maxlen=120)
     p = subprocess.Popen(
         cmd,
         cwd=str(cwd) if cwd is not None else None,
@@ -334,12 +415,16 @@ def _run_cmd(cmd: list[str], cwd: Path | None = None, env: dict[str, str] | None
     )
     assert p.stdout is not None
     for line in p.stdout:
-        print(line.rstrip("\n"))
+        line = line.rstrip("\n")
+        tail.append(line)
+        print(line)
     rc = p.wait()
     dt = time.time() - t0
     if rc != 0:
+        tail_text = "\n".join(tail)
         raise RuntimeError(
-            f"command failed (rc={rc}, {dt:.1f}s): {' '.join(cmd)}")
+            f"command failed (rc={rc}, {dt:.1f}s): {' '.join(cmd)}\n"
+            f"----- remote stdout tail -----\n{tail_text}")
     print(f"[remote] [ok] finished in {dt:.1f}s")
 
 
@@ -375,31 +460,32 @@ def _find_seq_dir(zju_root: Path, seq: str) -> Path:
 
 def _ensure_dataset(cfg: Cfg) -> None:
     """
-    Training requires {zju_root}/{seq}/vggt_geom to exist.
+    Training requires {zju_root}/{seq}/{geom_subdir} to exist.
     If not, try to extract from {archives_dir}/{seq}/... if present.
     """
     zju_root = Path(cfg.zju_root)
     archives_dir = Path(cfg.archives_dir)
+    geom_subdir = str(cfg.geom_subdir or "vggt_geom").strip() or "vggt_geom"
 
     for seq in cfg.seq_names:
         seq_dir = _find_seq_dir(zju_root, seq)
-        geom_dir = seq_dir / "vggt_geom"
+        geom_dir = seq_dir / geom_subdir
         if geom_dir.exists():
-            print(f"[remote] [ok] found vggt_geom: {geom_dir}")
+            print(f"[remote] [ok] found {geom_subdir}: {geom_dir}")
             continue
 
         # Attempt extraction from archives
         arc_seq = archives_dir / seq
         if not arc_seq.exists():
             raise RuntimeError(
-                f"[remote] missing vggt_geom and no archives found.\n"
+                f"[remote] missing {geom_subdir} and no archives found.\n"
                 f"  need: {geom_dir}\n"
                 f"  archives_dir: {arc_seq} (not found)"
             )
 
         # Extract all .tar / .tar.gz / .tgz under arc_seq into seq_dir
         print(
-            f"[remote] [warn] vggt_geom missing, extracting archives from: {arc_seq}")
+            f"[remote] [warn] {geom_subdir} missing, extracting archives from: {arc_seq}")
         seq_dir.mkdir(parents=True, exist_ok=True)
         extracted_any = False
         for tar_path in sorted(arc_seq.rglob("*.tar*")):
@@ -413,7 +499,7 @@ def _ensure_dataset(cfg: Cfg) -> None:
             raise RuntimeError(
                 f"[remote] after extraction, still missing: {geom_dir}")
 
-        print(f"[remote] [ok] extracted vggt_geom: {geom_dir}")
+        print(f"[remote] [ok] extracted {geom_subdir}: {geom_dir}")
 
 
 def _build_train_cmd(cfg: Cfg) -> list[str]:
@@ -432,6 +518,7 @@ def _build_train_cmd(cfg: Cfg) -> list[str]:
     args = [
         f"--zju_root={cfg.zju_root}",
         f"--seq_names={','.join(cfg.seq_names)}",
+        f"--geom_subdir={cfg.geom_subdir}",
         f"--log_dir={str(log_dir)}",
         f"--ckpt_dir={str(ckpt_dir)}",
         f"--epochs={cfg.epochs}",
@@ -446,6 +533,8 @@ def _build_train_cmd(cfg: Cfg) -> list[str]:
         f"--conf_qhi={cfg.conf_qhi}",
         f"--ema_decay={cfg.ema_decay}",
         f"--nan_check_every={cfg.nan_check_every}",
+        f"--min_improve={cfg.min_improve}",
+        f"--early_stop={int(cfg.early_stop)}",
     ]
     if cfg.conf_use_quantile_mask:
         args.append("--conf_use_quantile")
@@ -479,6 +568,9 @@ def _build_train_cmd(cfg: Cfg) -> list[str]:
 
     script_name = Path(cfg.train_script).name.lower()
     if "train_view_decoder_ablation" in script_name:
+        mask_sanity_mode = str(cfg.mask_sanity_mode or "warn").strip().lower()
+        if mask_sanity_mode not in ("warn", "raise", "off"):
+            mask_sanity_mode = "warn"
         args.extend([
             f"--view_select_mode={cfg.view_select_mode}",
             f"--yaw_jitter_deg={cfg.yaw_jitter_deg}",
@@ -488,6 +580,9 @@ def _build_train_cmd(cfg: Cfg) -> list[str]:
             f"--yaw_center_mode={cfg.yaw_center_mode}",
             f"--train_mask_mode={cfg.train_mask_mode}",
             f"--recon_mask_mode={cfg.recon_mask_mode}",
+            f"--mask_cover_min={cfg.mask_cover_min}",
+            f"--mask_cover_max={cfg.mask_cover_max}",
+            f"--mask_sanity_mode={mask_sanity_mode}",
             f"--mosaic_every_steps={int(cfg.mosaic_every_steps)}",
             f"--mosaic_num_targets={int(cfg.mosaic_num_targets)}",
             f"--mosaic_num_src_views={int(cfg.mosaic_num_src_views)}",
@@ -495,6 +590,14 @@ def _build_train_cmd(cfg: Cfg) -> list[str]:
             f"--mosaic_point_stride={int(cfg.mosaic_point_stride)}",
             f"--mosaic_seed={int(cfg.mosaic_seed)}",
         ])
+        if cfg.require_tgt_fg:
+            args.append("--require_tgt_fg")
+        else:
+            args.append("--no_require_tgt_fg")
+        if cfg.allow_fg_from_conf:
+            args.append("--allow_fg_from_conf")
+        else:
+            args.append("--no_allow_fg_from_conf")
 
     # Extra user-provided args
     if cfg.train_args_extra.strip():
@@ -559,6 +662,96 @@ def _resolve_precompute_ckpt_path(code_dir: Path, ckpt: str) -> Path:
     return default_ckpt
 
 
+def _resolve_infer_ckpt_path(code_dir: Path, cfg: Cfg) -> Path:
+    raw = (cfg.infer_ckpt or "").strip()
+    if not raw:
+        seq_tag = cfg.seq_names[0] if cfg.seq_names else "CoreView_390"
+        base = Path(MNT_OUT) / "viewdec_ablation"
+        cands = sorted(base.glob(f"{seq_tag}_*/ckpt/viewdec_ablation_best.pth"))
+        if cands:
+            return cands[-1]
+        raise RuntimeError(
+            "[remote] infer ckpt not provided and no auto-discovered best checkpoint.\n"
+            f"  searched: {base}/{seq_tag}_*/ckpt/viewdec_ablation_best.pth\n"
+            "  set VGGT_INFER_CKPT explicitly."
+        )
+
+    p = Path(raw)
+    candidates: list[Path] = []
+    if p.is_absolute():
+        candidates.append(p)
+    else:
+        candidates.append(Path(MNT_OUT) / raw)
+        candidates.append(code_dir / raw)
+
+    if "/" not in raw and "\\" not in raw:
+        candidates.append(
+            Path(MNT_OUT) / "viewdec_ablation" / raw / "ckpt" / "viewdec_ablation_best.pth")
+        candidates.append(Path(MNT_OUT) / "viewdec_ablation" /
+                          raw / "ckpt" / "viewdec_ablation_last.pth")
+
+    for cand in candidates:
+        if cand.exists():
+            return cand
+
+    if p.is_absolute():
+        return p
+    return candidates[0]
+
+
+def _resolve_infer_out_dir(cfg: Cfg) -> Path:
+    raw = (cfg.infer_out_dir or "").strip()
+    if raw:
+        p = Path(raw)
+        if p.is_absolute():
+            return p
+        return Path(MNT_OUT) / p
+
+    run_tag = time.strftime("%Y%m%d_%H%M%S")
+    seq_tag = cfg.seq_names[0] if cfg.seq_names else "seq"
+    return Path(MNT_OUT) / "infer_viewdec" / f"{seq_tag}_{run_tag}"
+
+
+def _build_infer_cmd(cfg: Cfg) -> list[str]:
+    code_dir = Path(MNT_CODE)
+    script = _resolve_script_path(code_dir, cfg.infer_script)
+    if not script.exists():
+        raise RuntimeError(f"[remote] infer_script not found: {script}")
+
+    ckpt_path = _resolve_infer_ckpt_path(code_dir, cfg)
+    if not ckpt_path.exists():
+        raise RuntimeError(
+            "[remote] checkpoint not found for infer.\n"
+            f"  requested: {cfg.infer_ckpt!r}\n"
+            f"  resolved: {ckpt_path}"
+        )
+    out_dir = _resolve_infer_out_dir(cfg)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    args = [
+        f"--ckpt={str(ckpt_path)}",
+        f"--split={str(cfg.infer_split or 'val')}",
+        f"--out_dir={str(out_dir)}",
+        f"--zju_root={cfg.zju_root}",
+        f"--batch_size={int(cfg.infer_batch_size)}",
+        f"--num_workers={int(cfg.infer_num_workers)}",
+        f"--num_samples={int(cfg.infer_num_samples)}",
+    ]
+    if cfg.seq_names:
+        args.append("--seq_names")
+        args.extend(cfg.seq_names)
+    if cfg.infer_use_ema:
+        args.append("--use_ema")
+    else:
+        args.append("--no_ema")
+    if cfg.infer_args_extra.strip():
+        args.extend(shlex.split(cfg.infer_args_extra))
+
+    print(f"[remote] infer ckpt = {ckpt_path}")
+    print(f"[remote] infer out_dir = {out_dir}")
+    return [sys.executable, str(script)] + args
+
+
 def _run_precompute(cfg: Cfg, code_dir: Path) -> None:
     script_path = _resolve_script_path(code_dir, cfg.precompute_script)
     if not script_path.exists():
@@ -584,12 +777,14 @@ def _run_precompute(cfg: Cfg, code_dir: Path) -> None:
             f"  top-level files sample: {top[:80]}"
         )
     print(f"[remote] precompute ckpt = {ckpt_path}")
+    print(f"[remote] precompute out_dir = {cfg.geom_subdir or 'vggt_geom'}")
 
     env = os.environ.copy()
     env["VGGT_ZJU_ROOT"] = str(cfg.zju_root)
     env["VGGT_SEQ_NAMES"] = ",".join(cfg.seq_names)
     env["VGGT_CKPT"] = str(ckpt_path)
     env["VGGT_PRECOMPUTE_CKPT"] = str(ckpt_path)
+    env["VGGT_OUT_DIR"] = str(cfg.geom_subdir or "vggt_geom")
     if cfg.cam_names:
         env["VGGT_CAM_NAMES"] = ",".join(cfg.cam_names)
     if int(cfg.max_frames) > 0:
@@ -605,6 +800,7 @@ def _run_precompute(cfg: Cfg, code_dir: Path) -> None:
         f"os.environ.setdefault('VGGT_SEQ_NAMES',{','.join(cfg.seq_names)!r}); ",
         f"os.environ.setdefault('VGGT_CKPT',{str(ckpt_path)!r}); ",
         f"os.environ.setdefault('VGGT_PRECOMPUTE_CKPT',{str(ckpt_path)!r}); ",
+        f"os.environ.setdefault('VGGT_OUT_DIR',{str(cfg.geom_subdir or 'vggt_geom')!r}); ",
     ]
     if cfg.cam_names:
         parts.append(
@@ -662,10 +858,17 @@ def run_remote(cfg_json: str) -> None:
             print(f"[remote] commit skipped/failed: {e}")
         return
 
-    # training path: ensure vggt_geom exists (or extract)
+    # infer/train paths: ensure geometry directory exists (or extract)
     _ensure_dataset(cfg)
 
-    cmd = _build_train_cmd(cfg)
+    mode = str(cfg.mode).lower().strip()
+    if mode.startswith("infer"):
+        print("[remote] mode = infer")
+        cmd = _build_infer_cmd(cfg)
+    else:
+        print("[remote] mode = train")
+        cmd = _build_train_cmd(cfg)
+
     env = os.environ.copy()
     env["PYTHONPATH"] = str(
         code_dir) + (":" + env.get("PYTHONPATH", "") if env.get("PYTHONPATH") else "")

@@ -1,0 +1,46 @@
+{
+    "model_id":  "phase5_final_r20260208_noema_rawpsnr",
+    "release_date":  "2026-02-08",
+    "status":  "frozen",
+    "selected_ckpt":  "/mnt/out/viewdec_ablation/CoreView_390_20260208_110514/ckpt/viewdec_ablation_best.pth",
+    "geom_subdir":  "vggt_geom_ft_20260208_044454",
+    "infer_contract":  {
+                           "mode":  "infer",
+                           "split":  "val",
+                           "use_ema":  false,
+                           "batch_size":  8,
+                           "num_workers":  8,
+                           "num_samples":  -1,
+                           "out_dir":  "/mnt/out/infer_viewdec/CoreView_390_phase5_final_release"
+                       },
+    "source_runs":  {
+                        "training_best_ckpt_run":  "CoreView_390_20260208_110514",
+                        "release_verify_run":  "phase5_final_release_verify_20260208_202628",
+                        "release_verify_modal_url":  "https://modal.com/apps/shimakaze22333/main/ap-gL7hBqCg0QnBZb17AUzxkA"
+                    },
+    "metrics":  {
+                    "N":  118,
+                    "mean_weighted_L1":  0.059921909281510415,
+                    "mean_PSNR":  21.199915368678205,
+                    "mean_SSIM":  0.86397355491832151
+                },
+    "compare_to_phase4_noema":  {
+                                    "phase4_mean_weighted_L1":  0.061976108289623667,
+                                    "phase4_mean_PSNR":  21.391603857783949,
+                                    "phase4_mean_SSIM":  0.85174855943453509,
+                                    "delta_weighted_L1":  -0.0020541990081132527,
+                                    "delta_PSNR":  -0.19168848910574354,
+                                    "delta_SSIM":  0.012224995483786416
+                                },
+    "validation_checks":  {
+                              "N_eq_118":  true,
+                              "source_fg_key_is_tgt_fg":  true,
+                              "tgt_mask_path_present":  true,
+                              "overlay_applied":  true,
+                              "reproducibility_match_prev_metrics":  true
+                          },
+    "rollback_candidates":  [
+                                "/mnt/out/viewdec_ablation/CoreView_390_20260207_185302/ckpt/viewdec_ablation_best.pth",
+                                "/mnt/out/viewdec_ablation/CoreView_390_20260208_065946/ckpt/viewdec_ablation_best.pth"
+                            ]
+}

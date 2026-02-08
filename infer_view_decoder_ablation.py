@@ -89,6 +89,8 @@ def build_cfg_from_ckpt_and_cli(ckpt_args: Dict[str, Any], cli: Any) -> SimpleNa
         cfg, "zju_root", None)
     if cli.seq_names is not None and len(cli.seq_names) > 0:
         cfg.seq_names = cli.seq_names
+    if getattr(cli, "geom_subdir", None) is not None:
+        cfg.geom_subdir = str(cli.geom_subdir)
 
     # dataset knobs (override if provided)
     if cli.num_src_views is not None:
@@ -217,6 +219,8 @@ def build_cfg_from_ckpt_and_cli(ckpt_args: Dict[str, Any], cli: Any) -> SimpleNa
         cfg.view_affine_strength = 1.0
     if not hasattr(cfg, "view_cond_mode"):
         cfg.view_cond_mode = "tgt"
+    if not hasattr(cfg, "geom_subdir"):
+        cfg.geom_subdir = "vggt_geom"
 
     cfg.seq_names = _normalize_seq_names(getattr(cfg, "seq_names", None))
     return cfg
@@ -363,11 +367,11 @@ def _adjust_conf_cfg_from_stats(cfg: SimpleNamespace, stats: Dict[str, float]) -
     }
 
 
-def _filter_existing_seq_names(seq_names, zju_root):
+def _filter_existing_seq_names(seq_names, zju_root, geom_subdir="vggt_geom"):
     existing = []
     missing = []
     for name in seq_names:
-        geom_dir = os.path.join(zju_root, name, "vggt_geom")
+        geom_dir = os.path.join(zju_root, name, str(geom_subdir))
         if os.path.isdir(geom_dir):
             existing.append(name)
         else:
@@ -455,6 +459,7 @@ def main():
     # optional overrides (otherwise taken from ckpt['args'])
     parser.add_argument("--zju_root", type=str, default=None)
     parser.add_argument("--seq_names", type=str, nargs="*", default=None)
+    parser.add_argument("--geom_subdir", type=str, default=None)
 
     parser.add_argument("--num_src_views", type=int, default=None)
     parser.add_argument("--frame_subsample", type=int, default=None)
@@ -530,7 +535,7 @@ def main():
         torch.backends.cudnn.benchmark = True
 
     # --- load ckpt ---
-    # 或者直接 load_checkpoint(args.ckpt, "cpu")
+    # Equivalent to calling load_checkpoint(args.ckpt, "cpu")
     ckpt = load_checkpoint(args.ckpt, device="cpu")
     ckpt_args = ckpt.get("args", {}) if isinstance(ckpt, dict) else {}
     cfg = build_cfg_from_ckpt_and_cli(ckpt_args, args)
@@ -546,7 +551,8 @@ def main():
             "seq_names is empty. Provide --seq_names ... or make sure ckpt['args']['seq_names'] exists.")
 
     seq_names = list(cfg.seq_names)
-    existing, missing = _filter_existing_seq_names(seq_names, cfg.zju_root)
+    existing, missing = _filter_existing_seq_names(
+        seq_names, cfg.zju_root, getattr(cfg, "geom_subdir", "vggt_geom"))
     if missing:
         if len(existing) == 0:
             missing_str = ", ".join(
@@ -566,6 +572,7 @@ def main():
     ds = ZJUViewSynthDataset(
         root=cfg.zju_root,
         seq_names=cfg.seq_names,
+        geom_subdir=str(getattr(cfg, "geom_subdir", "vggt_geom")),
         split=cfg.split,
         num_src_views=int(cfg.num_src_views),
         frame_subsample=int(cfg.frame_subsample),
@@ -573,6 +580,7 @@ def main():
         split_seed=int(cfg.split_seed),
         deterministic_views=deterministic_views,
         view_seed=int(cfg.view_seed),
+        return_paths=True,
     )
     dl = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
                     num_workers=args.num_workers, pin_memory=True)
@@ -866,6 +874,11 @@ def main():
                     "tgt_depth_conf": aux_masks.get("tgt_depth_conf", None),
                     "tgt_depth_conf_raw": aux_masks.get("tgt_depth_conf_raw", None),
                     "tgt_depth": batch.get("tgt_depth", None),
+                    "tgt_fg": batch.get("tgt_fg", None),
+                    "tgt_img_path": batch.get("tgt_img_path", None),
+                    "tgt_mask_path": batch.get("tgt_mask_path", None),
+                    "tgt_vid": batch.get("tgt_vid", None),
+                    "source_fg_key": aux_masks.get("source_fg_key", None),
                     "fg_mask": fg_mask.detach(),
                     "train_mask": train_mask.detach(),
                     "recon_weight": recon_weight.detach(),
@@ -948,3 +961,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

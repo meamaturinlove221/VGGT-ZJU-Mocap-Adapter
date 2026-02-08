@@ -23,7 +23,7 @@ class ZJUViewSynthDataset(Dataset):
         train_ratio=0.9,
         split_seed=0,
         split_mode="random",
-        deterministic_views=False,  # True 时每个样本固定 src/tgt 选法（val/test 建议 True）
+        deterministic_views=False,  # True 时每个样本固定 src/tgt 选择（val/test 建议 True）
         view_seed=2025,
         view_select_mode: str = "random",  # random / uniform_yaw
         yaw_jitter_deg: float = 20.0,
@@ -37,6 +37,10 @@ class ZJUViewSynthDataset(Dataset):
         tgt_view_names_exclude=None,
         return_cam: bool = False,
         return_paths: bool = False,
+        geom_subdir: str = "vggt_geom",
+        mask_cover_min: float = 0.01,
+        mask_cover_max: float = 0.80,
+        mask_sanity_mode: str = "warn",
         bad_sample_policy: str = "warn",
         white_mean_thr: float = 0.98,
         white_std_thr: float = 1e-3,
@@ -44,12 +48,12 @@ class ZJUViewSynthDataset(Dataset):
         bad_sample_max_retry: int = 3,
     ):
         """
-        读取 precompute_zju_vggt_geom.py 生成的 npz（vggt_geom/*.npz）
+        读取 precompute_zju_vggt_geom.py 生成的 npz（geom_subdir/*.npz）
         每个样本：随机选 1 个 tgt 视角 + num_src_views 个 src 视角
 
         split:
-          - None: 使用所有帧（你也可以外部 random_split）
-          - "train"/"val"/"test": 内部按 train_ratio 切分（val/test 用同一份后半段）
+          - None: 使用所有帧（也可外部 random_split）
+          - "train"/"val"/"test": 内部按 train_ratio 切分（val/test 为同一后半段）
         """
         self.root = root
         self.seq_names = list(seq_names)
@@ -86,6 +90,12 @@ class ZJUViewSynthDataset(Dataset):
         self._tgt_view_names_exclude_raw = tgt_view_names_exclude
         self.return_cam = bool(return_cam)
         self.return_paths = bool(return_paths)
+        self.geom_subdir = str(geom_subdir or "vggt_geom").strip() or "vggt_geom"
+        self.mask_cover_min = float(mask_cover_min)
+        self.mask_cover_max = float(mask_cover_max)
+        self.mask_sanity_mode = str(mask_sanity_mode or "warn").lower().strip()
+        if self.mask_sanity_mode not in ("warn", "raise", "off"):
+            self.mask_sanity_mode = "warn"
         self.bad_sample_policy = str(
             bad_sample_policy or "warn").lower().replace("-", "_")
         if self.bad_sample_policy not in ("warn", "skip", "raise", "mask", "drop_src"):
@@ -95,12 +105,13 @@ class ZJUViewSynthDataset(Dataset):
         self.report_bad_samples = bool(report_bad_samples)
         self.bad_sample_max_retry = int(bad_sample_max_retry)
         self._reported_bad = set()
+        self._reported_mask_sanity = set()
 
-        # --- 收集所有帧（all samples） ---
+        # --- 收集所有帧（all samples）---
         all_samples = []
         global_idx = 0
         for seq in self.seq_names:
-            geom_dir = osp.join(root, seq, "vggt_geom")
+            geom_dir = osp.join(root, seq, self.geom_subdir)
             if not osp.isdir(geom_dir):
                 raise FileNotFoundError(
                     f"[ZJUViewSynthDataset] geom dir not found: {geom_dir}")
@@ -249,14 +260,14 @@ class ZJUViewSynthDataset(Dataset):
         if osp.isabs(s):
             return s
 
-        # 2) Windows 绝对路径：形如 "F:/..."" 或 "C:/..."
+        # 2) Windows 绝对路径：形如 "F:/..." 或 "C:/..."
         if re.match(r"^[A-Za-z]:/", s):
             # 优先从 /zju_mocap/ 之后截断（最稳）
             key = "/zju_mocap/"
             if key in s:
                 s = s.split(key, 1)[1]
             else:
-                # 次选：从 CoreView_xxx 之后截断
+                # 备选：从 CoreView_xxx 之后截断
                 parts = s.split("/")
                 cut = None
                 for i, p in enumerate(parts):
@@ -279,51 +290,75 @@ class ZJUViewSynthDataset(Dataset):
         return osp.join(self.root, s.lstrip("/"))
 
     def _process_depth_like(self, arr: np.ndarray) -> np.ndarray:
-        """兼容 (H,W) 和 (H,W,1)，统一成 (H,W)"""
+        """兼容 (H,W) 与 (H,W,1)，统一为 (H,W)"""
         if arr.ndim == 3 and arr.shape[-1] == 1:
             arr = arr[..., 0]
         return arr
 
     def _infer_mask_path(self, img_path: str):
-        """Infer mask path from image path by swapping images -> mask_cihp/mask."""
+        """Infer mask path from image path with robust aliases and camera tokens."""
         if not img_path:
             return None
         s = str(img_path).replace("\\", "/")
         parts = s.split("/")
-        idx_images = None
+
+        image_tokens = {"images", "images_512", "images_1024", "imgs", "img"}
+        mask_tokens = ["mask", "masks", "mask_cihp", "masks_cihp"]
+
+        def _is_cam_token(token: str) -> bool:
+            t = str(token).strip()
+            if not t:
+                return False
+            tl = t.lower()
+            if tl.startswith("camera_"):
+                return True
+            if re.fullmatch(r"\d+", t) is not None:
+                return True
+            return False
+
+        idx_image = None
+        for i, p in enumerate(parts):
+            if str(p).lower() in image_tokens:
+                idx_image = i
+                break
+
         idx_cam = None
-        if "images" in parts:
-            idx_images = parts.index("images")
-        else:
-            for i, p in enumerate(parts):
-                if p.startswith("Camera_"):
-                    idx_cam = i
-                    break
-        if idx_images is None and idx_cam is None:
+        for i, p in enumerate(parts):
+            if _is_cam_token(p):
+                idx_cam = i
+                break
+
+        if idx_image is None and idx_cam is None:
             return None
 
-        def _build(mask_dir: str):
-            if idx_images is not None:
-                parts2 = list(parts)
-                parts2[idx_images] = mask_dir
-            else:
-                parts2 = list(parts[:idx_cam]) + [mask_dir] + list(parts[idx_cam:])
+        candidates = []
+        if idx_image is not None:
+            prefix = list(parts[:idx_image])
+            suffix = list(parts[idx_image + 1:])
+            for token in mask_tokens:
+                candidates.append(prefix + [token] + suffix)
+        if idx_cam is not None:
+            prefix = list(parts[:idx_cam])
+            suffix = list(parts[idx_cam:])
+            for token in mask_tokens:
+                candidates.append(prefix + [token] + suffix)
+
+        seen = set()
+        for parts2 in candidates:
             out = "/".join(parts2)
             base, _ = osp.splitext(out)
-            return base + ".png"
-
-        p_mask = _build("mask")
-        if osp.isfile(p_mask):
-            return p_mask
-        p_cihp = _build("mask_cihp")
-        if osp.isfile(p_cihp):
-            return p_cihp
+            cand = base + ".png"
+            if cand in seen:
+                continue
+            seen.add(cand)
+            if osp.isfile(cand):
+                return cand
         return None
 
     def _normalize_conf(self, conf: np.ndarray) -> np.ndarray:
         """把置信度图规范到 float32 的 [0,1]。
 
-        常见来源会出现：
+        常见来源：
         - 已经是 [0,1] 的 float
         - uint8 / float 的 [0,255]
         - 任意正尺度（回退：除以 max）
@@ -331,7 +366,7 @@ class ZJUViewSynthDataset(Dataset):
         conf = conf.astype(np.float32, copy=False)
         if conf.size == 0:
             return conf
-        # NaN/Inf 清零，避免训练炸掉
+        # NaN/Inf 清零，避免训练崩溃
         if not np.isfinite(conf).all():
             conf = np.nan_to_num(conf, nan=0.0, posinf=0.0, neginf=0.0)
         maxv = float(conf.max())
@@ -354,8 +389,14 @@ class ZJUViewSynthDataset(Dataset):
         if not np.isfinite(m).all():
             m = np.nan_to_num(m, nan=0.0, posinf=0.0, neginf=0.0)
         maxv = float(m.max())
-        if maxv > 1.5:
+        if maxv <= 1.5:
+            pass
+        elif maxv <= 32.0:
+            m = m / (maxv + 1e-8)
+        elif maxv <= 255.0 + 1e-3:
             m = m / 255.0
+        else:
+            m = m / (maxv + 1e-8)
         return np.clip(m, 0.0, 1.0)
 
     def _assert_depth_shapes(self, d, c, pm, geom_path, view_idx, view_id, role):
@@ -449,6 +490,93 @@ class ZJUViewSynthDataset(Dataset):
                 )
             else:
                 print(f"  stats: <none> reason={reason}")
+
+    def _dump_mask_sanity_overlay(
+        self,
+        tgt_img_pil: Image.Image,
+        tgt_fg: torch.Tensor,
+        img_path: str,
+        mask_path: str,
+        cover: float,
+        reason: str,
+    ) -> str:
+        out_dir = osp.join(os.getcwd(), "debug_mask_sanity")
+        os.makedirs(out_dir, exist_ok=True)
+        seq = "unknown_seq"
+        try:
+            pparts = str(img_path).replace("\\", "/").split("/")
+            for p in pparts:
+                if str(p).startswith("CoreView_"):
+                    seq = str(p)
+                    break
+        except Exception:
+            pass
+        cam = osp.basename(osp.dirname(str(img_path))) if img_path else "unknown_cam"
+        stem = osp.splitext(osp.basename(str(img_path)))[0] if img_path else "unknown_frame"
+        safe_reason = re.sub(r"[^A-Za-z0-9_]+", "_", str(reason)).strip("_")
+        safe_reason = safe_reason or "mask_cover"
+        out_name = f"{seq}_{cam}_{stem}_{safe_reason}_c{cover:.4f}".replace(".", "p")
+        out_png = osp.join(out_dir, out_name + ".png")
+
+        rgb = np.array(tgt_img_pil.convert("RGB"), dtype=np.float32)
+        fg = tgt_fg.detach().cpu().numpy().astype(np.float32)
+        mask = fg > 0.5
+        if mask.any():
+            alpha = 0.35
+            red = np.array([255.0, 0.0, 0.0], dtype=np.float32)
+            rgb[mask] = rgb[mask] * (1.0 - alpha) + red * alpha
+        vis = np.clip(rgb, 0.0, 255.0).round().astype(np.uint8)
+        Image.fromarray(vis).save(out_png)
+
+        payload = {
+            "img_path": str(img_path),
+            "mask_path": str(mask_path),
+            "cover": float(cover),
+            "reason": str(reason),
+            "mask_cover_min": float(self.mask_cover_min),
+            "mask_cover_max": float(self.mask_cover_max),
+        }
+        try:
+            with open(out_png.replace(".png", ".json"), "w", encoding="utf-8") as f:
+                import json
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+        return out_png
+
+    def _check_mask_cover_sanity(
+        self,
+        tgt_img_pil: Image.Image,
+        tgt_fg: torch.Tensor,
+        img_path: str,
+        mask_path: str,
+    ) -> None:
+        if self.mask_sanity_mode == "off":
+            return
+        cover = float(tgt_fg.float().mean().item())
+        low = float(self.mask_cover_min)
+        high = float(self.mask_cover_max)
+        if low <= cover <= high:
+            return
+        reason = f"mask_cover_out_of_range[{low:.4f},{high:.4f}]"
+        key = (str(img_path), str(mask_path), round(cover, 4), reason)
+        overlay_path = self._dump_mask_sanity_overlay(
+            tgt_img_pil=tgt_img_pil,
+            tgt_fg=tgt_fg,
+            img_path=img_path,
+            mask_path=mask_path,
+            cover=cover,
+            reason=reason,
+        )
+        msg = (
+            f"cover={cover:.4f} out of [{low:.4f}, {high:.4f}] "
+            f"img={img_path} mask={mask_path} overlay={overlay_path}"
+        )
+        if self.mask_sanity_mode == "raise":
+            raise RuntimeError(msg)
+        if key not in self._reported_mask_sanity:
+            self._reported_mask_sanity.add(key)
+            print(f"[ZJUViewSynthDataset][mask_sanity][warn] {msg}")
 
     def __getitem__(self, index, _retry: int = 0):
         meta = self.samples[index]
@@ -733,6 +861,12 @@ class ZJUViewSynthDataset(Dataset):
         tgt_mask = torch.from_numpy(tgt_mask_np).float()
         # ensure binary {0,1} foreground mask
         tgt_fg = (tgt_mask > 0.5).float()
+        self._check_mask_cover_sanity(
+            tgt_img_pil=tgt_img_pil,
+            tgt_fg=tgt_fg,
+            img_path=tgt_img_path,
+            mask_path=mask_path,
+        )
         if bad_tgt_masked:
             tgt_fg = torch.zeros_like(tgt_fg)
 
@@ -779,8 +913,9 @@ class ZJUViewSynthDataset(Dataset):
             "tgt_img": tgt_img,
             "tgt_depth": tgt_depth,
             "tgt_depth_conf": tgt_conf,
-            "tgt_conf": tgt_conf,  # 兼容旧 key
+            "tgt_conf": tgt_conf,  # 兼容key
             "tgt_fg": tgt_fg,
+            "tgt_mask_path": mask_path,
             "tgt_pointmap": tgt_pointmap,
             "tgt_vid": torch.tensor(tgt_vid, dtype=torch.long),
             "src_vids": torch.tensor(src_vids, dtype=torch.long),
@@ -806,6 +941,7 @@ class ZJUViewSynthDataset(Dataset):
                 sample.update({
                     "geom_path": geom_path,
                     "tgt_img_path": tgt_img_path,
+                    "tgt_mask_path": mask_path,
                     "src_img_paths": [self._resolve_img_path(img_paths[i]) for i in src_indices_used],
                     "cam_names": cam_names if cam_names is not None else None,
                 })
@@ -847,6 +983,10 @@ def _dump_one_batch_from_args(args):
         tgt_view_names_exclude=args.tgt_view_names_exclude,
         return_cam=True,
         return_paths=True,
+        geom_subdir=str(getattr(args, "geom_subdir", "vggt_geom")),
+        mask_cover_min=float(args.mask_cover_min),
+        mask_cover_max=float(args.mask_cover_max),
+        mask_sanity_mode=str(args.mask_sanity_mode),
     )
     if len(ds) == 0:
         raise SystemExit("dataset empty")
@@ -864,7 +1004,7 @@ def _dump_one_batch_from_args(args):
         "tgt_img", "tgt_depth", "tgt_depth_conf", "tgt_pointmap",
         "src_K", "src_T", "tgt_K", "tgt_T",
         "src_vids", "tgt_vid",
-        "geom_path", "tgt_img_path", "src_img_paths", "cam_names",
+        "geom_path", "tgt_img_path", "tgt_mask_path", "src_img_paths", "cam_names",
     ]
     for k in keep_keys:
         if k in sample:
@@ -902,6 +1042,11 @@ def _build_dump_parser():
     ap.add_argument("--tgt_view_names", type=str, default=None)
     ap.add_argument("--tgt_view_ids_exclude", type=str, default=None)
     ap.add_argument("--tgt_view_names_exclude", type=str, default=None)
+    ap.add_argument("--geom_subdir", type=str, default="vggt_geom")
+    ap.add_argument("--mask_cover_min", type=float, default=0.01)
+    ap.add_argument("--mask_cover_max", type=float, default=0.80)
+    ap.add_argument("--mask_sanity_mode", type=str, default="warn",
+                    choices=["warn", "raise", "off"])
     return ap
 
 
@@ -910,3 +1055,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.dump_one_batch:
         _dump_one_batch_from_args(args)
+
+
+

@@ -39,12 +39,35 @@ class VGGTGeomTeacher(torch.nn.Module):
         super().__init__()
         self.device = _resolve_device(device)
 
-        model = VGGT().to(self.device)
         print(f"[VGGTGeomTeacher] loading weights from {ckpt_path}")
         state = torch.load(ckpt_path, map_location=self.device)
         if isinstance(state, dict) and "state_dict" in state:
             state = state["state_dict"]
-        model.load_state_dict(state, strict=True)
+        if isinstance(state, dict) and "model" in state and isinstance(state["model"], dict):
+            state = state["model"]
+        if not isinstance(state, dict):
+            raise RuntimeError(f"unexpected checkpoint type: {type(state)}")
+        keys = [str(k) for k in state.keys()]
+        if keys and all(k.startswith("module.") for k in keys):
+            state = {k[len("module."):]: v for k, v in state.items()}
+            keys = [str(k) for k in state.keys()]
+
+        has_track = any(k.startswith("track_head.") for k in keys)
+        model = VGGT(enable_track=has_track).to(self.device)
+        model_keys = set(model.state_dict().keys())
+        matched = len(model_keys.intersection(set(keys)))
+        if matched <= 0:
+            raise RuntimeError(
+                f"no matching keys between checkpoint and model: {ckpt_path}"
+            )
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        print(
+            "[VGGTGeomTeacher] load_state_dict strict=False",
+            f"enable_track={has_track}",
+            f"matched={matched}",
+            f"missing={len(missing)}",
+            f"unexpected={len(unexpected)}",
+        )
         model.eval()
         self.model = model
 

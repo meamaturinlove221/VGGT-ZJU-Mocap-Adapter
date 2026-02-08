@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 import os
 import sys
 import time
@@ -47,28 +47,31 @@ from view_decoder_losses import (
 
 # Global args holder for optional access in helpers.
 args = None
+_VALID_COVER_HIGH_STREAK = 0
+_WARNED_FG_CONF_FALLBACK = False
+_WARNED_FG_VALID_FALLBACK = False
 
 # train_view_decoder_ablation_v3.py
 # -*- coding: utf-8 -*-
 """
 ZJU ViewSynth - View Decoder Ablation Trainer v3
 
-在 v2 的基础上新增/修复：
-- ? 自动把三合一 cat 图切成 3 张：*_p0/_p1/_p2（方便你逐栏看）
-- ? debug/val 时对 conf/weight/mask 做分位数统计（写 ini），定位“conf 塌缩/权重发黑”等问题
-- ? 修复 pred_conf clamp 截断梯度：自动判断 logits -> sigmoid，否则再 clamp
-- ? conf supervision 的归一化可以和 mask 归一化解耦（防止 quantile 每 batch 抖导致 conf 学歪）
+在 v2 基础上的改动：
+- 自动把三合一 cat 图切成 3 张（*_p0/_p1/_p2），便于逐栏查看
+- debug/val 时对 conf/weight/mask 做分位统计（写入 ini），用于定位塌陷与权重发黑
+- 修复 pred_conf clamp 梯度：自动判断 logits -> sigmoid，否则再 clamp
+- conf supervision 的归一化可与 mask 归一化解耦，避免每 batch 抖动
 
-v3.1 (本次修复)：
-- ? FIX: fg/valid/train 等“二值掩码”在阈值比较前自动识别 0~255 并归一到 0~1
-      避免 uint8 掩码直接 >0.5 导致 mask 全白（你现在遇到的核心问题）
+v3.1（本次修复）：
+- FIX：fg/valid/train 等二值掩码在阈值比较前自动识别 0~255 并归一到 0~1
+  避免 uint8 掩码直接 >0.5 导致 mask 全白
 
 运行：
   python train_view_decoder_ablation_v3.py
 
 常用：
-  python train_view_decoder_ablation_v3.py --seq_names CoreView_390 --zju_root F:\datasets\ZJU_MoCap\data\zju_mocap
-  python train_view_decoder_ablation_v3.py --resume ckpt\viewdec_ablation_last.pth
+  python train_view_decoder_ablation_v3.py --seq_names CoreView_390 --zju_root F:/datasets/ZJU_MoCap/data/zju_mocap
+  python train_view_decoder_ablation_v3.py --resume ckpt/viewdec_ablation_last.pth
 """
 
 # --- make local imports stable (Windows + run-from-anywhere) ---
@@ -294,17 +297,17 @@ def apply_valid_to_depth_conf(
 # ---------------------------
 def to_01_mask(mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """
-    仅用于“掩码类”张量（valid/fg/train/alpha/seg等）：
+    仅用于“掩码类”张量（valid/fg/train/alpha/seg 等）
     - 如果看起来是 uint8 0~255，则自动 /255
     - clamp 到 [0,1]
-    注意：不要用它处理深度conf那种可能在 1~8 的连续量。
+    注意：不要用它处理深度/置信度那类可能在 1~8 的连续量。
     """
     m = _ensure_4d(mask)
     if m is None:
         return None
     m = m.float()
-    # 关键：mask 若来自 PNG/uint8，通常 max=255。
-    # 用 >8.0 作为阈值，避免把 1~8 的 conf 误判为 255 范围。
+    # 关键：mask 若来自 PNG/uint8，通常 max=255
+    # 用 >8.0 判断，避免把 1~8 的 conf 误判成 255 范围
     mx = float(m.detach().amax().cpu())
     mn = float(m.detach().amin().cpu())
     if mx > 8.0 and mn >= -eps:
@@ -325,7 +328,7 @@ def binarize(mask: torch.Tensor, thr: float = 0.5) -> torch.Tensor:
     mask = _ensure_4d(mask)
     if mask is None:
         return None
-    # FIX: 0~255 -> 0~1，再阈值
+    # FIX: 0~255 -> 0~1，再阈值化
     mask01 = to_01_mask(mask)
     return (mask01 > float(thr)).float()
 
@@ -435,7 +438,7 @@ def ensure_min_cover_by_dilation(mask_bin: torch.Tensor, min_cover: float, k0: i
     mask_bin = _ensure_4d(mask_bin)
     if mask_bin is None:
         return None
-    # FIX: 保证输入是 {0,1} 掩码
+    # FIX: 确保输入是 {0,1} 掩码
     mask_bin = binarize(mask_bin, 0.5).float()
     if min_cover is None or float(min_cover) <= 0:
         return mask_bin
@@ -867,7 +870,7 @@ def tensor_stats_1d(vals: torch.Tensor, prefix: str = "") -> dict:
 
 @torch.no_grad()
 def tensor_stats_map(x: torch.Tensor, mask: Optional[torch.Tensor] = None, prefix: str = "") -> dict:
-    """x: (B,1,H,W) or (B,H,W) or any -> 取全部像素/或 mask>0.5 的像素统计"""
+    """Compute summary stats for a tensor, optionally over a binary mask."""
     if x is None:
         return {f"{prefix}n": 0}
     t = x.detach()
@@ -910,8 +913,8 @@ def normalize_conf_to_01(
     mn = float(c.min().item())
     mx = float(c.max().item())
 
-    # FIX: 如果 conf 来自 uint8 0~255（或类似），先缩放到 0~1 再走后续逻辑
-    # 用 >16 判定，避免把 1~8 的深度置信误判
+    # FIX：若 conf 来自 uint8 0~255（或类似），先缩放到 0~1 再走后续逻辑
+    # 用 >16 判断，避免把 1~8 的深度置信误判为 255 范围
     if auto and mx > 16.0 and mn >= -0.2:
         c = (c / 255.0).clamp(0.0, 1.0)
         mn = float(c.min().item())
@@ -1025,10 +1028,7 @@ def make_soft_mask_from_conf(
 # pred_conf normalization (new, avoids clamp killing gradients)
 # ---------------------------
 def normalize_pred_conf(pred_conf: torch.Tensor) -> Tuple[torch.Tensor, str]:
-    """
-    如果 pred_conf 看起来像 logits（范围明显超出[0,1]），就用 sigmoid。
-    否则按概率图处理，轻微 clamp。
-    """
+    """Normalize predicted confidence to [0,1] with logit auto-detection."""
     pc = pred_conf.float()
     mn = float(pc.min().item())
     mx = float(pc.max().item())
@@ -1100,11 +1100,21 @@ def assert_batch_shapes(batch: Dict[str, Any], where: str):
     _assert_tensor_ok(
         tgt_depth_conf, name="tgt_depth_conf", where=where, ndims=(3, 4))
 
-    _, tgt_fg = _require_any_tensor(
-        batch, ["tgt_fg", "fg_mask", "tgt_fg_mask", "tgt_mask", "tgt_silhouette", "silhouette",
-                "human_mask", "person_mask", "tgt_alpha", "alpha", "seg", "tgt_seg"],
-        where
-    )
+    require_tgt_fg = True
+    if args is not None and hasattr(args, "require_tgt_fg"):
+        require_tgt_fg = bool(getattr(args, "require_tgt_fg"))
+    if require_tgt_fg:
+        tgt_fg = batch.get("tgt_fg", None)
+        if tgt_fg is None:
+            raise KeyError(
+                f"[batch-assert] {where}: missing required key 'tgt_fg' (require_tgt_fg=True)"
+            )
+    else:
+        _, tgt_fg = _require_any_tensor(
+            batch, ["tgt_fg", "fg_mask", "tgt_fg_mask", "tgt_mask", "tgt_silhouette", "silhouette",
+                    "human_mask", "person_mask", "tgt_alpha", "alpha", "seg", "tgt_seg"],
+            where
+        )
     _assert_tensor_ok(tgt_fg, name="tgt_fg", where=where, ndims=(3, 4))
 
     if args is not None and bool(getattr(args, "fg_drop_ground", False)):
@@ -1178,6 +1188,8 @@ def build_masks_from_batch(
     fg_dilate_k: int = 7,
     fg_keep_largest_cc: bool = True,
     fg_lcc_min_pixels: int = 32,
+    require_tgt_fg: Optional[bool] = None,
+    allow_fg_from_conf: Optional[bool] = None,
     fg_drop_ground: Optional[bool] = None,
     fg_ground_axis: Optional[int] = None,
     fg_ground_q: Optional[float] = None,
@@ -1237,6 +1249,34 @@ def build_masks_from_batch(
             m = m[:B]
         return m > 0.5
 
+    def _first_meta_value(v):
+        if v is None:
+            return None
+        if torch.is_tensor(v):
+            if v.numel() == 0:
+                return None
+            try:
+                return v.view(-1)[0].item()
+            except Exception:
+                return str(v)
+        if isinstance(v, np.ndarray):
+            if v.size == 0:
+                return None
+            flat = v.reshape(-1)
+            vv = flat[0]
+            try:
+                vv = vv.item()
+            except Exception:
+                pass
+            return _first_meta_value(vv)
+        if isinstance(v, (list, tuple)):
+            if len(v) == 0:
+                return None
+            return _first_meta_value(v[0])
+        return v
+
+    global _VALID_COVER_HIGH_STREAK, _WARNED_FG_CONF_FALLBACK, _WARNED_FG_VALID_FALLBACK
+
     # ---- depth conf ----
     depth_conf_key, tgt_depth_conf = pick_first_tensor(
         batch, ["tgt_depth_conf", "depth_conf_tgt",
@@ -1257,7 +1297,7 @@ def build_masks_from_batch(
     tgt_depth_key, tgt_depth = pick_first_tensor(
         batch, ["tgt_depth", "depth_tgt", "tgt_depth_map", "depth"])
     if valid_raw is not None:
-        # FIX: binarize 内部会自动把 0~255 归一到 0~1
+        # FIX: binarize 内部会把 0~255 归一到 0~1
         valid_mask = binarize(resize_mask_nearest(
             valid_raw.to(device), (H, W)), 0.5)
         source_valid_key = valid_key
@@ -1270,8 +1310,8 @@ def build_masks_from_batch(
             (tgt_depth_conf.shape[0], 1, H, W), device=device, dtype=torch.float32)
         source_valid_key = "__all_ones__"
 
-    cover_valid0 = float(valid_mask.mean().item())
-    if cover_valid0 < float(valid_min_cover):
+    cover_valid_init = float(valid_mask.mean().item())
+    if cover_valid_init < float(valid_min_cover):
         valid_mask = ensure_min_cover_by_dilation(valid_mask, float(
             valid_min_cover), int(valid_dilate_k), int(valid_k_max))
 
@@ -1283,6 +1323,18 @@ def build_masks_from_batch(
     if bad_tgt_masked is not None and torch.any(bad_tgt_masked):
         valid_mask = valid_mask.clone()
         valid_mask[bad_tgt_masked] = 0
+    cover_valid0 = float(valid_mask.mean().item())
+    if cover_valid0 > 0.995:
+        _VALID_COVER_HIGH_STREAK += 1
+        if (_VALID_COVER_HIGH_STREAK % 50) == 0:
+            print(
+                "[mask] [warn] valid_mask cover_valid>0.995 for "
+                f"{_VALID_COVER_HIGH_STREAK} consecutive batches "
+                f"(source_valid_key={source_valid_key}, cover_valid={cover_valid0:.4f}). "
+                "valid_mask may have little filtering effect."
+            )
+    else:
+        _VALID_COVER_HIGH_STREAK = 0
 
     # ---- apply valid to depth conf (only supervise on valid) ----
     tgt_depth_conf = tgt_depth_conf_raw
@@ -1291,27 +1343,53 @@ def build_masks_from_batch(
         tgt_depth_conf = tgt_depth_conf * vm_conf
 
     # ---- fg mask ----
-    fg_key, fg_raw = pick_first_tensor(
-        batch, ["tgt_fg", "fg_mask", "tgt_fg_mask", "tgt_mask", "tgt_silhouette", "silhouette",
-                "human_mask", "person_mask", "tgt_alpha", "alpha", "seg", "tgt_seg"]
-    )
+    require_tgt_fg_v = bool(_resolve_opt(require_tgt_fg, "require_tgt_fg", True))
+    allow_fg_from_conf_v = bool(_resolve_opt(allow_fg_from_conf, "allow_fg_from_conf", False))
+    if require_tgt_fg_v:
+        fg_key = "tgt_fg" if ("tgt_fg" in batch) else None
+        fg_raw = batch.get("tgt_fg", None)
+    else:
+        fg_key, fg_raw = pick_first_tensor(
+            batch, ["tgt_fg", "fg_mask", "tgt_fg_mask", "tgt_mask", "tgt_silhouette", "silhouette",
+                    "human_mask", "person_mask", "tgt_alpha", "alpha", "seg", "tgt_seg"]
+        )
 
     tgt_conf_key, tgt_conf_raw = pick_first_tensor(
         batch, ["tgt_conf", "tgt_mask_conf", "conf_tgt"])
     if fg_raw is not None:
-        fg_up = resize_mask_nearest(fg_raw.to(device), (H, W))
-        fg_mask0 = binarize(fg_up, thr=float(fg_thr))  # FIX: 内部 to_01_mask
+        fg_src = fg_raw.to(device) if torch.is_tensor(fg_raw) else torch.as_tensor(fg_raw, device=device)
+        fg_up = resize_mask_nearest(fg_src, (H, W))
+        fg_mask0 = binarize(fg_up, thr=float(fg_thr))
         source_fg_key = fg_key
-    elif tgt_conf_raw is not None:
+    elif tgt_conf_raw is not None and allow_fg_from_conf_v:
         conf_up = F.interpolate(
             tgt_conf_raw.to(device).float(), size=(H, W), mode="nearest"
         )
-        conf_up = to_01_mask(conf_up)  # FIX: 0~255 -> 0~1，避免 clamp(0,1) 直接全 1
+        conf_up = to_01_mask(conf_up)
         fg_mask0 = (conf_up > float(fg_thr)).float()
         source_fg_key = tgt_conf_key
+        if not _WARNED_FG_CONF_FALLBACK:
+            print(
+                "[mask] [warn] fg mask fallback to tgt_conf is enabled "
+                f"(allow_fg_from_conf=True, source_fg_key={source_fg_key})."
+            )
+            _WARNED_FG_CONF_FALLBACK = True
+    elif require_tgt_fg_v:
+        tgt_img_path = _first_meta_value(batch.get("tgt_img_path", None))
+        raise KeyError(
+            "[mask] require_tgt_fg=True but batch['tgt_fg'] is missing. "
+            f"batch.keys={sorted([str(k) for k in batch.keys()])}; "
+            f"tgt_img_path={tgt_img_path}"
+        )
     else:
         fg_mask0 = valid_mask.clone()
         source_fg_key = "__fallback_valid__"
+        if not _WARNED_FG_VALID_FALLBACK:
+            print(
+                "[mask] [warn] fg mask fallback to valid_mask is active "
+                "(no usable foreground mask source)."
+            )
+            _WARNED_FG_VALID_FALLBACK = True
 
     # optional: remove ground using pointmap height quantile
     source_pointmap_key = None
@@ -1576,6 +1654,8 @@ def build_masks_from_batch(
         "conf_mask_mode": conf_mask_mode,
         "train_mask_mode": train_mask_mode,
         "recon_mask_mode": recon_mask_mode,
+        "require_tgt_fg": bool(require_tgt_fg_v),
+        "allow_fg_from_conf": bool(allow_fg_from_conf_v),
         "source_fg_key": source_fg_key,
         "source_valid_key": source_valid_key,
         "source_depth_conf_key": depth_conf_key,
@@ -1792,9 +1872,10 @@ def save_debug_pack(
     pred_raw = pred
     pred_vis = pred
     vis_weight = None
-    if isinstance(aux, dict):
-        gate = aux.get("gate", None)
-        recon_weight = aux.get("recon_weight", None)
+    aux_dict = aux if isinstance(aux, dict) else {}
+    if aux_dict:
+        gate = aux_dict.get("gate", None)
+        recon_weight = aux_dict.get("recon_weight", None)
         if torch.is_tensor(gate):
             vis_weight = gate
         if torch.is_tensor(recon_weight):
@@ -1833,9 +1914,6 @@ def save_debug_pack(
     path_cat_ptd = os.path.join(
         out_dir, f"{prefix}_cat_pred_tgt_diff_step{step:06d}.png")
     save_png(cat_ptd, path_cat_ptd)
-
-    if not aux:
-        return
 
     H, W = int(pred.shape[-2]), int(pred.shape[-1])
 
@@ -1887,39 +1965,98 @@ def save_debug_pack(
         if split_cat_panels:
             save_cat_panels(cat, path_cat)
 
-    if isinstance(aux, dict):
-        tgt_fg = aux.get("tgt_fg", None)
-        if torch.is_tensor(tgt_fg):
+    def _first_scalar(v):
+        if v is None:
+            return None
+        if torch.is_tensor(v):
+            if v.numel() == 0:
+                return None
             try:
-                if tgt_fg.dim() == 2:
-                    tgt_fg = tgt_fg.unsqueeze(0).unsqueeze(0)
-                elif tgt_fg.dim() == 3:
-                    tgt_fg = tgt_fg.unsqueeze(1)
-                if tgt_fg.ndim == 4:
-                    tgt_fg = _resize_to_hw(tgt_fg, is_mask=True)
-                    fg = (tgt_fg[0, 0] > 0.5).float()
-                    mask = fg.detach().cpu().numpy().astype(bool)
-                    if mask.any():
-                        overlay = tgt_img.astype(np.float32)
-                        alpha = 0.35
-                        green = np.array([0.0, 255.0, 0.0], dtype=np.float32)
-                        overlay[mask] = overlay[mask] * (1.0 - alpha) + green * alpha
-                        overlay = np.clip(overlay, 0, 255).round().astype(np.uint8)
-                    else:
-                        overlay = tgt_img.copy()
-                    path_overlay = os.path.join(
-                        out_dir, f"{prefix}_gt_with_fg_overlay_step{step:06d}.png")
-                    save_png(overlay, path_overlay)
+                return v.view(-1)[0].item()
+            except Exception:
+                return str(v)
+        if isinstance(v, np.ndarray):
+            if v.size == 0:
+                return None
+            flat = v.reshape(-1)
+            vv = flat[0]
+            try:
+                vv = vv.item()
             except Exception:
                 pass
+            return _first_scalar(vv)
+        if isinstance(v, (list, tuple)):
+            if len(v) == 0:
+                return None
+            return _first_scalar(v[0])
+        return v
+
+    def _as_str(v):
+        if v is None:
+            return ""
+        return str(v)
+
+    overlay = tgt_img.copy()
+    overlay_applied = False
+    overlay_cover = 0.0
+    tgt_fg = aux_dict.get("tgt_fg", None)
+    if torch.is_tensor(tgt_fg):
+        try:
+            if tgt_fg.dim() == 2:
+                tgt_fg = tgt_fg.unsqueeze(0).unsqueeze(0)
+            elif tgt_fg.dim() == 3:
+                tgt_fg = tgt_fg.unsqueeze(1)
+            if tgt_fg.ndim == 4:
+                tgt_fg = _resize_to_hw(tgt_fg, is_mask=True)
+                fg = (tgt_fg[0, 0] > 0.5).float()
+                mask = fg.detach().cpu().numpy().astype(bool)
+                overlay_cover = float(mask.mean()) if mask.size > 0 else 0.0
+                if mask.any():
+                    overlay = tgt_img.astype(np.float32)
+                    alpha = 0.35
+                    green = np.array([0.0, 255.0, 0.0], dtype=np.float32)
+                    overlay[mask] = overlay[mask] * (1.0 - alpha) + green * alpha
+                    overlay = np.clip(overlay, 0, 255).round().astype(np.uint8)
+                    overlay_applied = True
+        except Exception:
+            overlay = tgt_img.copy()
+            overlay_applied = False
+
+    path_overlay = os.path.join(
+        out_dir, f"{prefix}_gt_with_fg_overlay_step{step:06d}.png")
+    save_png(overlay, path_overlay)
+    sidecar = {
+        "step": int(step),
+        "prefix": str(prefix),
+        "tgt_img_path": _as_str(_first_scalar(aux_dict.get("tgt_img_path", None))),
+        "tgt_mask_path": _as_str(_first_scalar(aux_dict.get("tgt_mask_path", None))),
+        "tgt_vid": _first_scalar(aux_dict.get("tgt_vid", None)),
+        "source_fg_key": _as_str(_first_scalar(aux_dict.get("source_fg_key", None))),
+        "overlay_applied": bool(overlay_applied),
+        "overlay_cover": float(overlay_cover),
+    }
+    try:
+        with open(path_overlay.replace(".png", ".json"), "w", encoding="utf-8") as f:
+            json.dump(sidecar, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+    try:
+        with open(path_overlay.replace(".png", ".txt"), "w", encoding="utf-8") as f:
+            for k, v in sidecar.items():
+                f.write(f"{k}: {v}\n")
+    except Exception:
+        pass
+
+    if not aux_dict:
+        return
 
     for key in ["valid_mask", "fg_mask", "train_mask",
                 "recon_weight_raw", "recon_weight",
                 "tgt_depth_conf", "tgt_depth_conf_raw",
                 "tgt_depth", "pred_depth",
                 "pred_conf", "gate", "gate_loss"]:
-        if key in aux and isinstance(aux[key], torch.Tensor):
-            _save1(key, aux[key])
+        if key in aux_dict and isinstance(aux_dict[key], torch.Tensor):
+            _save1(key, aux_dict[key])
 
 
 def build_vis_ranges(args) -> Optional[dict]:
@@ -1964,7 +2101,7 @@ def dump_batch_npz(batch: Dict[str, Any], path: str) -> None:
         "tgt_img", "tgt_depth", "tgt_depth_conf", "tgt_pointmap",
         "src_K", "src_T", "tgt_K", "tgt_T",
         "src_vids", "tgt_vid",
-        "geom_path", "tgt_img_path", "src_img_paths", "cam_names",
+        "geom_path", "tgt_img_path", "tgt_mask_path", "src_img_paths", "cam_names",
     ]
     out = {}
     for k in keep_keys:
@@ -2184,6 +2321,8 @@ def parse_args():
                    default=r"F:\datasets\ZJU_MoCap\data\zju_mocap")
     p.add_argument("--seq_names", type=str, default="CoreView_390",
                    help="comma separated, e.g. CoreView_390,CoreView_392")
+    p.add_argument("--geom_subdir", type=str, default="vggt_geom",
+                   help="Geometry subdirectory under each sequence root.")
 
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--accum_steps", type=int, default=1,
@@ -2432,6 +2571,14 @@ def parse_args():
     p.add_argument("--recon_mask_mode", type=str, default="fg",
                    choices=["fg", "train", "valid"],
                    help="Recon-weight base mask: fg, train, or valid")
+    p.add_argument("--require_tgt_fg", dest="require_tgt_fg", action="store_true", default=True,
+                   help="Require batch['tgt_fg'] as foreground source (default on).")
+    p.add_argument("--no_require_tgt_fg", dest="require_tgt_fg", action="store_false",
+                   help="Allow fallback to other fg-like keys.")
+    p.add_argument("--allow_fg_from_conf", dest="allow_fg_from_conf", action="store_true", default=False,
+                   help="Allow fallback fg mask from tgt_conf when tgt_fg is missing.")
+    p.add_argument("--no_allow_fg_from_conf", dest="allow_fg_from_conf", action="store_false",
+                   help="Disable fg fallback from tgt_conf.")
     p.add_argument("--log_mask_stats", dest="log_mask_stats", action="store_true", default=True,
                    help="Log mask coverage/CC/boundary stats")
     p.add_argument("--no_log_mask_stats", dest="log_mask_stats", action="store_false",
@@ -2458,6 +2605,13 @@ def parse_args():
     p.add_argument("--valid_min_cover", type=float, default=0.10)
     p.add_argument("--valid_dilate_k", type=int, default=7)
     p.add_argument("--valid_k_max", type=int, default=31)
+    p.add_argument("--mask_cover_min", type=float, default=0.01,
+                   help="Lower bound for tgt_fg cover sanity check in dataset.")
+    p.add_argument("--mask_cover_max", type=float, default=0.80,
+                   help="Upper bound for tgt_fg cover sanity check in dataset.")
+    p.add_argument("--mask_sanity_mode", type=str, default="warn",
+                   choices=["warn", "raise", "off"],
+                   help="Action when tgt_fg cover is outside [mask_cover_min, mask_cover_max].")
     p.add_argument("--bg_weight", type=float, default=0.05)
     p.add_argument("--recon_weight_renorm", action="store_true", default=False,
                    help="Renormalize recon_weight so train-mask mean ~1")
@@ -2478,11 +2632,11 @@ def parse_args():
     p.add_argument("--conf_qhi", type=float, default=0.95)
 
     p.add_argument("--conf_sup_use_quantile", action="store_true", default=False,
-                   help="conf supervision 用 quantile 归一化（默认关，避免每 batch 抖动）")
+                   help="Use quantile normalization for confidence supervision target")
     p.add_argument("--conf_sup_gamma", type=float, default=1.0,
-                   help="对 conf target 做幂次（>1 更强调高置信；<1 更平滑）")
+                   help="Gamma applied to confidence supervision target")
     p.add_argument("--conf_floor_thr", type=float,
-                   default=0.05, help="pred_conf 的最低值软约束阈值")
+                   default=0.05, help="Soft lower-threshold for predicted confidence")
     p.add_argument("--conf_floor_w", type=float,
                    default=0.1, help="pred_conf floor 约束权重")
 
@@ -2519,9 +2673,9 @@ def parse_args():
     p.add_argument("--vis_weight_min", type=float, default=0.0)
     p.add_argument("--vis_weight_max", type=float, default=1.0)
 
-    # Debug viz: 是否把 *_cat_*.png 进一步切成三栏（p0/p1/p2）方便对比
+    # Debug viz: 是否把 *_cat_*.png 再切成三栏（p0/p1/p2），便于对比
     p.add_argument("--split_cat_panels", action="store_true", default=True,
-                   help="保存 *_cat_*.png 时额外输出 *_p0/_p1/_p2 三栏切片")
+                   help="淇濆瓨 *_cat_*.png 鏃堕澶栬緭鍑?*_p0/_p1/_p2 涓夋爮鍒囩墖")
     p.add_argument("--no_split_cat_panels", dest="split_cat_panels", action="store_false",
                    help="Disable split cat panels in debug viz")
 
@@ -2652,7 +2806,13 @@ def main():
         "conf_sup_gamma": args.conf_sup_gamma,
         "train_mask_mode": args.train_mask_mode,
         "recon_mask_mode": args.recon_mask_mode,
+        "require_tgt_fg": args.require_tgt_fg,
+        "allow_fg_from_conf": args.allow_fg_from_conf,
+        "mask_cover_min": args.mask_cover_min,
+        "mask_cover_max": args.mask_cover_max,
+        "mask_sanity_mode": args.mask_sanity_mode,
         "split_mode": args.split_mode,
+        "geom_subdir": args.geom_subdir,
         "view_select_mode": args.view_select_mode,
         "yaw_jitter_deg": args.yaw_jitter_deg,
         "yaw_phase_jitter_deg": args.yaw_phase_jitter_deg,
@@ -2693,10 +2853,15 @@ def main():
     # ---------------------------
     # Dataset
     # ---------------------------
-    need_geom_path = bool(int(args.mosaic_every_steps) > 0)
+    need_geom_path = bool(
+        (int(args.mosaic_every_steps) > 0)
+        or (int(args.debug_train_every) > 0)
+        or bool(args.debug_val_every_epoch)
+    )
     base_ds = ZJUViewSynthDataset(
         root=args.zju_root,
         seq_names=seq_names,
+        geom_subdir=args.geom_subdir,
         num_src_views=args.num_src_views,
         frame_subsample=args.frame_subsample,
         view_select_mode=args.view_select_mode,
@@ -2707,6 +2872,9 @@ def main():
         yaw_center_mode=args.yaw_center_mode,
         split=None,
         return_paths=need_geom_path,
+        mask_cover_min=args.mask_cover_min,
+        mask_cover_max=args.mask_cover_max,
+        mask_sanity_mode=args.mask_sanity_mode,
         bad_sample_policy=args.bad_sample_policy,
         white_mean_thr=args.white_mean_thr,
         white_std_thr=args.white_std_thr,
@@ -2716,6 +2884,7 @@ def main():
     train_dataset = ZJUViewSynthDataset(
         root=args.zju_root,
         seq_names=seq_names,
+        geom_subdir=args.geom_subdir,
         num_src_views=args.num_src_views,
         frame_subsample=args.frame_subsample,
         split="train",
@@ -2732,6 +2901,9 @@ def main():
         tgt_view_names_exclude=(holdout_view_names if holdout_view_names else None),
         deterministic_views=False,
         return_paths=need_geom_path,
+        mask_cover_min=args.mask_cover_min,
+        mask_cover_max=args.mask_cover_max,
+        mask_sanity_mode=args.mask_sanity_mode,
         bad_sample_policy=args.bad_sample_policy,
         white_mean_thr=args.white_mean_thr,
         white_std_thr=args.white_std_thr,
@@ -2741,6 +2913,7 @@ def main():
     val_dataset = ZJUViewSynthDataset(
         root=args.zju_root,
         seq_names=seq_names,
+        geom_subdir=args.geom_subdir,
         num_src_views=args.num_src_views,
         frame_subsample=args.frame_subsample,
         split="val",
@@ -2757,6 +2930,9 @@ def main():
         tgt_view_names=(holdout_view_names if holdout_view_names else None),
         deterministic_views=True,
         return_paths=need_geom_path,
+        mask_cover_min=args.mask_cover_min,
+        mask_cover_max=args.mask_cover_max,
+        mask_sanity_mode=args.mask_sanity_mode,
         bad_sample_policy=args.bad_sample_policy,
         white_mean_thr=args.white_mean_thr,
         white_std_thr=args.white_std_thr,
@@ -3175,6 +3351,8 @@ def main():
                         recon_mask_mode=args.recon_mask_mode,
                         recon_weight_renorm=args.recon_weight_renorm,
                         recon_weight_clip_max=args.recon_weight_clip_max,
+                        require_tgt_fg=args.require_tgt_fg,
+                        allow_fg_from_conf=args.allow_fg_from_conf,
                     )
                     l1w = masked_l1(pred_rgb, tgt_img, recon_weight)
 
@@ -3251,6 +3429,10 @@ def main():
                         "tgt_depth_conf_raw": aux_masks.get("tgt_depth_conf_raw", None),
                         "tgt_depth": batch.get("tgt_depth", None),
                         "tgt_fg": batch.get("tgt_fg", None),
+                        "tgt_img_path": batch.get("tgt_img_path", None),
+                        "tgt_mask_path": batch.get("tgt_mask_path", None),
+                        "tgt_vid": batch.get("tgt_vid", None),
+                        "source_fg_key": aux_masks.get("source_fg_key", None),
                         "fg_mask": fg_mask.detach(),
                         "train_mask": train_mask.detach(),
                         "recon_weight": recon_weight.detach(),
@@ -3459,6 +3641,8 @@ def main():
                 recon_mask_mode=args.recon_mask_mode,
                 recon_weight_renorm=args.recon_weight_renorm,
                 recon_weight_clip_max=args.recon_weight_clip_max,
+                require_tgt_fg=args.require_tgt_fg,
+                allow_fg_from_conf=args.allow_fg_from_conf,
             )
             pred_conf_safe_dbg, _ = normalize_pred_conf(pred_conf_dbg)
             aux_dbg = {
@@ -3467,6 +3651,10 @@ def main():
                 "tgt_depth_conf_raw": aux_masks_dbg.get("tgt_depth_conf_raw", None),
                 "tgt_depth": b.get("tgt_depth", None),
                 "tgt_fg": b.get("tgt_fg", None),
+                "tgt_img_path": b.get("tgt_img_path", None),
+                "tgt_mask_path": b.get("tgt_mask_path", None),
+                "tgt_vid": b.get("tgt_vid", None),
+                "source_fg_key": aux_masks_dbg.get("source_fg_key", None),
                 "fg_mask": fg_mask_dbg.detach(),
                 "train_mask": train_mask_dbg.detach(),
                 "recon_weight": recon_weight_dbg.detach(),
@@ -3626,6 +3814,8 @@ def main():
                     recon_mask_mode=args.recon_mask_mode,
                     recon_weight_renorm=args.recon_weight_renorm,
                     recon_weight_clip_max=args.recon_weight_clip_max,
+                    require_tgt_fg=args.require_tgt_fg,
+                    allow_fg_from_conf=args.allow_fg_from_conf,
                 )
 
                 recon_weight_loss = recon_weight.detach() if torch.is_tensor(recon_weight) else recon_weight
@@ -4118,6 +4308,10 @@ def main():
                     "tgt_depth_conf_raw": aux_masks.get("tgt_depth_conf_raw", None),
                     "tgt_depth": batch.get("tgt_depth", None),
                     "tgt_fg": batch.get("tgt_fg", None),
+                    "tgt_img_path": batch.get("tgt_img_path", None),
+                    "tgt_mask_path": batch.get("tgt_mask_path", None),
+                    "tgt_vid": batch.get("tgt_vid", None),
+                    "source_fg_key": aux_masks.get("source_fg_key", None),
                     "fg_mask": fg_mask.detach(),
                     "train_mask": train_mask.detach(),
                     "recon_weight": recon_weight.detach(),
@@ -4284,3 +4478,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

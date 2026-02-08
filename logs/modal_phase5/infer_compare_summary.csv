@@ -1,0 +1,4 @@
+run,ckpt,prefer_ema,N,mean_weighted_L1,mean_PSNR,mean_SSIM,delta_psnr_vs_phase4_c,delta_ssim_vs_phase4_c,delta_wl1_vs_phase4_c
+phase4_c_best_ema,/mnt/out/viewdec_ablation/CoreView_390_20260207_185302/ckpt/viewdec_ablation_best.pth,True,118,0.06478307661363635,20.934740777743066,0.844079534886247,0.0,0.0,0.0
+phase5_ft_best_ema,/mnt/out/viewdec_ablation/CoreView_390_20260208_065946/ckpt/viewdec_ablation_best.pth,True,118,0.15379769475025645,14.687238660909362,0.600571646528729,-6.247502116833704,-0.24350788835751802,0.08901461813662011
+phase5_ft_best_noema,/mnt/out/viewdec_ablation/CoreView_390_20260208_065946/ckpt/viewdec_ablation_best.pth,False,118,0.13978403118454805,15.42681498446707,0.6557241683289156,-5.507925793275996,-0.18835536655733143,0.0750009545709117

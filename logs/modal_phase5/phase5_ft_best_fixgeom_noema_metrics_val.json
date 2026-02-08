@@ -1,0 +1,20 @@
+{
+  "split": "val",
+  "ckpt": "/mnt/out/viewdec_ablation/CoreView_390_20260208_065946/ckpt/viewdec_ablation_best.pth",
+  "prefer_ema": false,
+  "epoch_in_ckpt": 12,
+  "step_in_ckpt": 0,
+  "N": 118,
+  "mean_weighted_L1": 0.0607420382231979,
+  "mean_PSNR": 21.09858991331973,
+  "mean_SSIM": 0.8614123478784399,
+  "zju_root": "/mnt/data/zju_mocap",
+  "seq_names": [
+    "CoreView_390"
+  ],
+  "num_src_views": 3,
+  "frame_subsample": 1,
+  "train_ratio": 0.9,
+  "split_seed": 0,
+  "view_seed": 0
+}

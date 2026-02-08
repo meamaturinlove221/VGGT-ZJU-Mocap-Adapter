@@ -1,0 +1,10 @@
+{
+  "step": 0,
+  "prefix": "infer_val_e012",
+  "tgt_img_path": "",
+  "tgt_mask_path": "",
+  "tgt_vid": null,
+  "source_fg_key": "",
+  "overlay_applied": false,
+  "overlay_cover": 0.0
+}
