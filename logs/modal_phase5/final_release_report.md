@@ -39,3 +39,18 @@ powershell -ExecutionPolicy Bypass -File scripts/run_infer_phase5_final.ps1 -Cod
 ## Rollback Anchors
 - `/mnt/out/viewdec_ablation/CoreView_390_20260207_185302/ckpt/viewdec_ablation_best.pth`
 - `/mnt/out/viewdec_ablation/CoreView_390_20260208_065946/ckpt/viewdec_ablation_best.pth`
+
+## Gate Automation
+- script: `scripts/release_gate_phase5_final.ps1`
+- latest result: `logs/modal_phase5/release_gate_result_latest.json`
+- status: pass
+- run_url: <https://modal.com/apps/shimakaze22333/main/ap-q3VnwPsaK8Iil9CSGCtqRe>
+- infer_out_dir: `/mnt/out/infer_viewdec/CoreView_390_phase5_final_gate_20260208_214416`
+- checks: `N==118`, `PSNR>=21.15`, `SSIM>=0.860`, `wL1<=0.061`, `source_fg_key=tgt_fg`, `tgt_mask_path present`
+
+## Cross-Sequence Smoke
+- script: `scripts/cross_seq_smoke_phase5.ps1`
+- latest csv: `logs/modal_phase5/cross_seq_smoke_latest.csv`
+- latest json: `logs/modal_phase5/cross_seq_smoke_latest.json`
+- status: skipped
+- reason: no sequence with `vggt_geom_ft_20260208_044454` found after excluding `CoreView_390`

@@ -1,0 +1,33 @@
+{
+    "timestamp":  "20260208_214139",
+    "geom_subdir":  "vggt_geom_ft_20260208_044454",
+    "exclude_seq":  "CoreView_390",
+    "num_requested":  2,
+    "num_samples":  30,
+    "thresholds":  {
+                       "min_psnr":  19.5,
+                       "min_ssim":  0.82,
+                       "max_wl1":  0.085
+                   },
+    "discovered":  [
+
+                   ],
+    "selected":  [
+
+                 ],
+    "rows":  [
+                 {
+                     "seq":  "",
+                     "status":  "skipped",
+                     "pass":  false,
+                     "N":  "",
+                     "mean_PSNR":  "",
+                     "mean_SSIM":  "",
+                     "mean_weighted_L1":  "",
+                     "run_url":  "",
+                     "infer_out_dir":  "",
+                     "infer_out_volume_path":  "",
+                     "reason":  "no sequence with geom_subdir=\u0027vggt_geom_ft_20260208_044454\u0027 found (excluding CoreView_390)"
+                 }
+             ]
+}

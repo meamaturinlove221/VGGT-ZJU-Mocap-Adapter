@@ -1,0 +1,37 @@
+{
+    "pass":  true,
+    "thresholds":  {
+                       "min_psnr":  21.15,
+                       "min_ssim":  0.86,
+                       "max_wl1":  0.061,
+                       "expect_n":  118,
+                       "expected_source_fg_key":  "tgt_fg"
+                   },
+    "values":  {
+                   "N":  118,
+                   "mean_PSNR":  21.200192419149108,
+                   "mean_SSIM":  0.86397788484217752,
+                   "mean_weighted_L1":  0.059919270292177043,
+                   "source_fg_key":  "tgt_fg",
+                   "tgt_mask_path":  "/mnt/data/zju_mocap/CoreView_390/mask/Camera_B23/000637.png",
+                   "overlay_applied":  true
+               },
+    "checks":  {
+                   "n_eq_expect":  true,
+                   "psnr_ge_threshold":  true,
+                   "ssim_ge_threshold":  true,
+                   "wl1_le_threshold":  true,
+                   "source_fg_key_ok":  true,
+                   "tgt_mask_path_present":  true,
+                   "overlay_present":  true
+               },
+    "artifacts":  {
+                      "infer_out_dir":  "/mnt/out/infer_viewdec/CoreView_390_phase5_final_gate_20260208_213535",
+                      "infer_out_volume_path":  "/infer_viewdec/CoreView_390_phase5_final_gate_20260208_213535",
+                      "run_url":  "",
+                      "modal_log":  "logs/modal_phase5/release_gate_modal_20260208_214341.log",
+                      "metrics_path":  "logs/modal_phase5/release_gate_metrics_20260208_214341.json",
+                      "overlay_path":  "logs/modal_phase5/release_gate_overlay_20260208_214341.json"
+                  },
+    "timestamp":  "20260208_214341"
+}

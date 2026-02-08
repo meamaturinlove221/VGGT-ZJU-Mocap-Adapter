@@ -1,0 +1,31 @@
+{
+    "timestamp":  "20260208_213128",
+    "geom_subdir":  "vggt_geom_ft_20260208_044454",
+    "exclude_seq":  "__NONE__",
+    "num_requested":  1,
+    "num_samples":  1,
+    "thresholds":  {
+                       "min_psnr":  19.5,
+                       "min_ssim":  0.82,
+                       "max_wl1":  0.085
+                   },
+    "discovered":  "CoreView_390",
+    "selected":  [
+                     "CoreView_390"
+                 ],
+    "rows":  [
+                 {
+                     "seq":  "CoreView_390",
+                     "status":  "error",
+                     "pass":  false,
+                     "N":  "",
+                     "mean_PSNR":  "",
+                     "mean_SSIM":  "",
+                     "mean_weighted_L1":  "",
+                     "run_url":  "https://modal.com/apps/shimakaze22333/main/ap-En7FObCnom1lKKACd3Ezu0",
+                     "infer_out_dir":  "/mnt/out/infer_viewdec/CoreView_390_phase5_cross_smoke_20260208_213128",
+                     "infer_out_volume_path":  "/infer_viewdec/CoreView_390_phase5_cross_smoke_20260208_213128",
+                     "reason":  "failed to fetch/parse metrics"
+                 }
+             ]
+}

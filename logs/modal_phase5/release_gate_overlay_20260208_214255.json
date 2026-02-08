@@ -1,0 +1,10 @@
+{
+  "step": 0,
+  "prefix": "infer_val_e013",
+  "tgt_img_path": "/mnt/data/zju_mocap/CoreView_390/Camera_B23/000637.jpg",
+  "tgt_mask_path": "/mnt/data/zju_mocap/CoreView_390/mask/Camera_B23/000637.png",
+  "tgt_vid": 4,
+  "source_fg_key": "tgt_fg",
+  "overlay_applied": true,
+  "overlay_cover": 0.06667327880859375
+}

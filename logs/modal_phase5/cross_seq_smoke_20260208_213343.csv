@@ -1,0 +1,2 @@
+﻿"seq","status","pass","N","mean_PSNR","mean_SSIM","mean_weighted_L1","run_url","infer_out_dir","infer_out_volume_path","reason"
+"CoreView_390","ok","True","1","21.541109085083","0.87080854177475","0.0586626753211021","https://modal.com/apps/shimakaze22333/main/ap-af2M03ZHPYeL9cHEcOUrhE","/mnt/out/infer_viewdec/CoreView_390_phase5_cross_smoke_20260208_213343","/infer_viewdec/CoreView_390_phase5_cross_smoke_20260208_213343",""

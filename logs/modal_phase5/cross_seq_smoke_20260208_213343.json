@@ -1,0 +1,33 @@
+{
+    "timestamp":  "20260208_213343",
+    "geom_subdir":  "vggt_geom_ft_20260208_044454",
+    "exclude_seq":  "__NONE__",
+    "num_requested":  1,
+    "num_samples":  1,
+    "thresholds":  {
+                       "min_psnr":  19.5,
+                       "min_ssim":  0.82,
+                       "max_wl1":  0.085
+                   },
+    "discovered":  [
+                       "CoreView_390"
+                   ],
+    "selected":  [
+                     "CoreView_390"
+                 ],
+    "rows":  [
+                 {
+                     "seq":  "CoreView_390",
+                     "status":  "ok",
+                     "pass":  true,
+                     "N":  1,
+                     "mean_PSNR":  21.541109085083008,
+                     "mean_SSIM":  0.87080854177474976,
+                     "mean_weighted_L1":  0.058662675321102142,
+                     "run_url":  "https://modal.com/apps/shimakaze22333/main/ap-af2M03ZHPYeL9cHEcOUrhE",
+                     "infer_out_dir":  "/mnt/out/infer_viewdec/CoreView_390_phase5_cross_smoke_20260208_213343",
+                     "infer_out_volume_path":  "/infer_viewdec/CoreView_390_phase5_cross_smoke_20260208_213343",
+                     "reason":  ""
+                 }
+             ]
+}

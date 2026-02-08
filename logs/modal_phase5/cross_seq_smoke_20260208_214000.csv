@@ -1,0 +1,2 @@
+﻿"seq","status","pass","N","mean_PSNR","mean_SSIM","mean_weighted_L1","run_url","infer_out_dir","reason"
+"","skipped","False","","","","","","","no sequence with geom_subdir='vggt_geom_ft_20260208_044454' found (excluding CoreView_390)"
