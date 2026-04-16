@@ -1,6 +1,30 @@
 .hydra/
 output/
 ckpt/
+logs/
+infer_out/
+training/logs/
+training/**/ckpts/
+checkpoints_view_decoder/
+debug_viewdec/
+debug_viewdec_ablation/
+debug_vis/
+out_vis/
+overfit_debug/
+tmp_*/
+external/pixelsplat/
+.vscode/
+.cache/
+*.pt
+*.pth
+*.ckpt
+*.npz
+*.ply
+*.obj
+*.glb
+*.zip
+*.tar
+*.tar.*
 # Byte-compiled / optimized / DLL files
 __pycache__/
 **/__pycache__/
@@ -109,6 +133,7 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.venv5080/
 env/
 venv/
 ENV/
@@ -145,6 +170,7 @@ dmypy.json
 skyseg.onnx
 overfit_debug/
 debug_viewdec_ablation/
+tmp_modal_summary.json
 
 # pixi environments
 .pixi
@@ -152,6 +178,7 @@ debug_viewdec_ablation/
 
 model.pt
 *.pt
+*.torch
 models/*
 
 # Local backup artifacts (never commit)

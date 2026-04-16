@@ -120,10 +120,10 @@ def _sample_reprojection_metrics(
     )
 
 
-def _collect_npz_paths(zju_root: str, seq_names: list[str]) -> list[str]:
+def _collect_npz_paths(zju_root: str, seq_names: list[str], geom_subdir: str) -> list[str]:
     paths = []
     for seq in seq_names:
-        d = osp.join(zju_root, seq, "vggt_geom")
+        d = osp.join(zju_root, seq, str(geom_subdir))
         if not osp.isdir(d):
             continue
         for fn in sorted(os.listdir(d)):
@@ -144,6 +144,7 @@ def _main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--zju_root", type=str, required=True)
     ap.add_argument("--seq_names", type=str, default="CoreView_390")
+    ap.add_argument("--geom_subdir", type=str, default="vggt_geom")
     ap.add_argument("--out", type=str, default="camera_sanity_out")
     ap.add_argument("--num_frames", type=int, default=10)
     ap.add_argument("--seed", type=int, default=2026)
@@ -159,9 +160,11 @@ def _main():
     out_dir = str(args.out)
     os.makedirs(out_dir, exist_ok=True)
 
-    paths = _collect_npz_paths(str(args.zju_root), seq_names)
+    paths = _collect_npz_paths(str(args.zju_root), seq_names, geom_subdir=str(args.geom_subdir))
     if not paths:
-        raise RuntimeError(f"no npz found under {args.zju_root} for seq_names={seq_names}")
+        raise RuntimeError(
+            f"no npz found under {args.zju_root} for seq_names={seq_names} geom_subdir={args.geom_subdir}"
+        )
 
     rng = np.random.RandomState(int(args.seed))
     order = rng.permutation(len(paths))
@@ -250,6 +253,7 @@ def _main():
     summary = {
         "num_frames_checked": int(take_n),
         "num_views_checked": int(len(rows)),
+        "geom_subdir": str(args.geom_subdir),
         "mean_ortho_err": _safe_mean(ortho_vals),
         "max_ortho_err": float(np.nanmax(np.asarray(ortho_vals, dtype=np.float64))),
         "mean_abs_det_minus_1": _safe_mean(det_dev_vals),

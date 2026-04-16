@@ -4,6 +4,8 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+from concurrent.futures import ThreadPoolExecutor
+
 import torch
 from PIL import Image
 from torchvision import transforms as TF
@@ -94,7 +96,54 @@ def load_and_preprocess_images_square(image_path_list, target_size=1024):
     return images, original_coords
 
 
-def load_and_preprocess_images(image_path_list, mode="crop"):
+def _load_and_preprocess_single_image(image_path, mode="crop", target_size=518):
+    to_tensor = TF.ToTensor()
+
+    img = Image.open(image_path)
+
+    if img.mode == "RGBA":
+        background = Image.new("RGBA", img.size, (255, 255, 255, 255))
+        img = Image.alpha_composite(background, img)
+
+    img = img.convert("RGB")
+
+    width, height = img.size
+
+    if mode == "pad":
+        if width >= height:
+            new_width = target_size
+            new_height = round(height * (new_width / width) / 14) * 14
+        else:
+            new_height = target_size
+            new_width = round(width * (new_height / height) / 14) * 14
+    else:
+        new_width = target_size
+        new_height = round(height * (new_width / width) / 14) * 14
+
+    img = img.resize((new_width, new_height), Image.Resampling.BICUBIC)
+    img = to_tensor(img)
+
+    if mode == "crop" and new_height > target_size:
+        start_y = (new_height - target_size) // 2
+        img = img[:, start_y : start_y + target_size, :]
+
+    if mode == "pad":
+        h_padding = target_size - img.shape[1]
+        w_padding = target_size - img.shape[2]
+
+        if h_padding > 0 or w_padding > 0:
+            pad_top = h_padding // 2
+            pad_bottom = h_padding - pad_top
+            pad_left = w_padding // 2
+            pad_right = w_padding - pad_left
+            img = torch.nn.functional.pad(
+                img, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=1.0
+            )
+
+    return img
+
+
+def load_and_preprocess_images(image_path_list, mode="crop", num_workers=1, executor=None):
     """
     A quick start function to load and preprocess images for model input.
     This assumes the images should have the same shape for easier batching, but our model can also work well with different shapes.
@@ -129,69 +178,18 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
     if mode not in ["crop", "pad"]:
         raise ValueError("Mode must be either 'crop' or 'pad'")
 
-    images = []
-    shapes = set()
-    to_tensor = TF.ToTensor()
-    target_size = 518
+    worker_count = max(1, min(int(num_workers or 1), len(image_path_list)))
+    load_one = lambda path: _load_and_preprocess_single_image(path, mode=mode)
+    if worker_count > 1:
+        if executor is not None:
+            images = list(executor.map(load_one, image_path_list))
+        else:
+            with ThreadPoolExecutor(max_workers=worker_count) as ex:
+                images = list(ex.map(load_one, image_path_list))
+    else:
+        images = [load_one(image_path) for image_path in image_path_list]
 
-    # First process all images and collect their shapes
-    for image_path in image_path_list:
-        # Open image
-        img = Image.open(image_path)
-
-        # If there's an alpha channel, blend onto white background:
-        if img.mode == "RGBA":
-            # Create white background
-            background = Image.new("RGBA", img.size, (255, 255, 255, 255))
-            # Alpha composite onto the white background
-            img = Image.alpha_composite(background, img)
-
-        # Now convert to "RGB" (this step assigns white for transparent areas)
-        img = img.convert("RGB")
-
-        width, height = img.size
-
-        if mode == "pad":
-            # Make the largest dimension 518px while maintaining aspect ratio
-            if width >= height:
-                new_width = target_size
-                new_height = round(height * (new_width / width) / 14) * 14  # Make divisible by 14
-            else:
-                new_height = target_size
-                new_width = round(width * (new_height / height) / 14) * 14  # Make divisible by 14
-        else:  # mode == "crop"
-            # Original behavior: set width to 518px
-            new_width = target_size
-            # Calculate height maintaining aspect ratio, divisible by 14
-            new_height = round(height * (new_width / width) / 14) * 14
-
-        # Resize with new dimensions (width, height)
-        img = img.resize((new_width, new_height), Image.Resampling.BICUBIC)
-        img = to_tensor(img)  # Convert to tensor (0, 1)
-
-        # Center crop height if it's larger than 518 (only in crop mode)
-        if mode == "crop" and new_height > target_size:
-            start_y = (new_height - target_size) // 2
-            img = img[:, start_y : start_y + target_size, :]
-
-        # For pad mode, pad to make a square of target_size x target_size
-        if mode == "pad":
-            h_padding = target_size - img.shape[1]
-            w_padding = target_size - img.shape[2]
-
-            if h_padding > 0 or w_padding > 0:
-                pad_top = h_padding // 2
-                pad_bottom = h_padding - pad_top
-                pad_left = w_padding // 2
-                pad_right = w_padding - pad_left
-
-                # Pad with white (value=1.0)
-                img = torch.nn.functional.pad(
-                    img, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=1.0
-                )
-
-        shapes.add((img.shape[1], img.shape[2]))
-        images.append(img)
+    shapes = {(img.shape[1], img.shape[2]) for img in images}
 
     # Check if we have different shapes
     # In theory our model can also work well with different shapes

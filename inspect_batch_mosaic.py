@@ -343,10 +343,10 @@ def _make_target_block(
     return _concat_v([header, row0, row1, row2], pad=6)
 
 
-def _collect_npz_paths(zju_root: str, seq_names: list[str]) -> list[str]:
+def _collect_npz_paths(zju_root: str, seq_names: list[str], geom_subdir: str) -> list[str]:
     paths = []
     for seq in seq_names:
-        d = osp.join(zju_root, seq, "vggt_geom")
+        d = osp.join(zju_root, seq, str(geom_subdir))
         if not osp.isdir(d):
             continue
         for fn in sorted(os.listdir(d)):
@@ -432,6 +432,7 @@ def _main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--zju_root", type=str, required=True)
     ap.add_argument("--seq_names", type=str, default="CoreView_390")
+    ap.add_argument("--geom_subdir", type=str, default="vggt_geom")
     ap.add_argument("--out", type=str, default="inspect_batch_mosaic_out")
     ap.add_argument("--num_samples", type=int, default=1, help="How many random frame npz to inspect.")
     ap.add_argument("--num_targets", type=int, default=3, help="How many target views per frame.")
@@ -452,9 +453,11 @@ def _main():
     out_dir = str(args.out)
     os.makedirs(out_dir, exist_ok=True)
 
-    paths = _collect_npz_paths(zju_root, seq_names)
+    paths = _collect_npz_paths(zju_root, seq_names, geom_subdir=str(args.geom_subdir))
     if not paths:
-        raise RuntimeError(f"no npz found under {zju_root} for seq_names={seq_names}")
+        raise RuntimeError(
+            f"no npz found under {zju_root} for seq_names={seq_names} geom_subdir={args.geom_subdir}"
+        )
 
     rng = np.random.RandomState(int(args.seed))
     order = rng.permutation(len(paths))

@@ -46,6 +46,31 @@ function Get-ModalRunUrl([string[]]$Lines) {
     return $url
 }
 
+function Invoke-ModalRun([string]$ScriptPath = "modal_run_train.py") {
+    $stdoutFile = [System.IO.Path]::GetTempFileName()
+    $stderrFile = [System.IO.Path]::GetTempFileName()
+    try {
+        $proc = Start-Process `
+            -FilePath "cmd.exe" `
+            -ArgumentList @("/c", "modal run $ScriptPath") `
+            -NoNewWindow `
+            -Wait `
+            -PassThru `
+            -RedirectStandardOutput $stdoutFile `
+            -RedirectStandardError $stderrFile
+        $output = @()
+        if (Test-Path $stdoutFile) { $output += @(Get-Content $stdoutFile) }
+        if (Test-Path $stderrFile) { $output += @(Get-Content $stderrFile) }
+        return [pscustomobject]@{
+            Output = $output
+            ExitCode = [int]$proc.ExitCode
+        }
+    } finally {
+        Remove-Item $stdoutFile -ErrorAction SilentlyContinue
+        Remove-Item $stderrFile -ErrorAction SilentlyContinue
+    }
+}
+
 function Get-FirstOverlayJsonRemotePath([string]$RemoteOutDir) {
     $itemsJson = modal volume ls --json vggt-out $RemoteOutDir | Out-String
     $items = $itemsJson | ConvertFrom-Json
@@ -81,8 +106,9 @@ if (-not $SkipRun) {
     $env:VGGT_INFER_SPLIT = "val"
 
     Write-Host "[gate] running modal infer..."
-    $modalOutput = & modal run modal_run_train.py 2>&1
-    $runExitCode = $LASTEXITCODE
+    $run = Invoke-ModalRun -ScriptPath "modal_run_train.py"
+    $modalOutput = @($run.Output)
+    $runExitCode = [int]$run.ExitCode
     $modalOutput | Tee-Object -FilePath $logPath | Out-Null
     $runUrl = Get-ModalRunUrl -Lines $modalOutput
 } else {

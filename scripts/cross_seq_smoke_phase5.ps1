@@ -56,6 +56,31 @@ function Get-ModalRunUrl([string[]]$Lines) {
     return $url
 }
 
+function Invoke-ModalRun([string]$ScriptPath = "modal_run_train.py") {
+    $stdoutFile = [System.IO.Path]::GetTempFileName()
+    $stderrFile = [System.IO.Path]::GetTempFileName()
+    try {
+        $proc = Start-Process `
+            -FilePath "cmd.exe" `
+            -ArgumentList @("/c", "modal run $ScriptPath") `
+            -NoNewWindow `
+            -Wait `
+            -PassThru `
+            -RedirectStandardOutput $stdoutFile `
+            -RedirectStandardError $stderrFile
+        $output = @()
+        if (Test-Path $stdoutFile) { $output += @(Get-Content $stdoutFile) }
+        if (Test-Path $stderrFile) { $output += @(Get-Content $stderrFile) }
+        return [pscustomobject]@{
+            Output = $output
+            ExitCode = [int]$proc.ExitCode
+        }
+    } finally {
+        Remove-Item $stdoutFile -ErrorAction SilentlyContinue
+        Remove-Item $stderrFile -ErrorAction SilentlyContinue
+    }
+}
+
 function Discover-SeqsFromVolume([string]$geomSubdir) {
     $out = @()
     try {
@@ -125,8 +150,9 @@ if ($selected.Count -eq 0) {
         $env:VGGT_INFER_NUM_SAMPLES = [string]$NumSamples
         $env:VGGT_INFER_SPLIT = "val"
 
-        $modalOutput = & modal run modal_run_train.py 2>&1
-        $runExitCode = $LASTEXITCODE
+        $run = Invoke-ModalRun -ScriptPath "modal_run_train.py"
+        $modalOutput = @($run.Output)
+        $runExitCode = [int]$run.ExitCode
         $modalOutput | Tee-Object -FilePath $runLog | Out-Null
         $runUrl = Get-ModalRunUrl -Lines $modalOutput
 

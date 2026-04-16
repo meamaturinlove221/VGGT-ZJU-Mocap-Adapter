@@ -12,8 +12,23 @@ import numpy as np
 from vggt.dependency.distortion import apply_distortion, iterative_undistortion, single_undistortion
 
 
+def _resolve_unproject_impl(unproject_impl: str | None) -> tuple[str, float]:
+    mode = str(unproject_impl or "legacy").strip().lower()
+    if mode in {"legacy", "orig", "default"}:
+        return "legacy", 0.0
+    if mode in {"upstream433", "pixel_center", "center_0.5"}:
+        return "upstream433", 0.5
+    raise ValueError(
+        f"unsupported unproject_impl={unproject_impl}, "
+        "expected one of ['legacy','upstream433']"
+    )
+
+
 def unproject_depth_map_to_point_map(
-    depth_map: np.ndarray, extrinsics_cam: np.ndarray, intrinsics_cam: np.ndarray
+    depth_map: np.ndarray,
+    extrinsics_cam: np.ndarray,
+    intrinsics_cam: np.ndarray,
+    unproject_impl: str = "legacy",
 ) -> np.ndarray:
     """
     Unproject a batch of depth maps to 3D world coordinates.
@@ -33,10 +48,15 @@ def unproject_depth_map_to_point_map(
     if isinstance(intrinsics_cam, torch.Tensor):
         intrinsics_cam = intrinsics_cam.cpu().numpy()
 
+    _, pixel_center_offset = _resolve_unproject_impl(unproject_impl)
+
     world_points_list = []
     for frame_idx in range(depth_map.shape[0]):
         cur_world_points, _, _ = depth_to_world_coords_points(
-            depth_map[frame_idx].squeeze(-1), extrinsics_cam[frame_idx], intrinsics_cam[frame_idx]
+            depth_map[frame_idx].squeeze(-1),
+            extrinsics_cam[frame_idx],
+            intrinsics_cam[frame_idx],
+            pixel_center_offset=pixel_center_offset,
         )
         world_points_list.append(cur_world_points)
     world_points_array = np.stack(world_points_list, axis=0)
@@ -48,6 +68,7 @@ def depth_to_world_coords_points(
     depth_map: np.ndarray,
     extrinsic: np.ndarray,
     intrinsic: np.ndarray,
+    pixel_center_offset: float = 0.0,
     eps=1e-8,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
@@ -68,7 +89,11 @@ def depth_to_world_coords_points(
     point_mask = depth_map > eps
 
     # Convert depth map to camera coordinates
-    cam_coords_points = depth_to_cam_coords_points(depth_map, intrinsic)
+    cam_coords_points = depth_to_cam_coords_points(
+        depth_map,
+        intrinsic,
+        pixel_center_offset=pixel_center_offset,
+    )
 
     # Multiply with the inverse of extrinsic matrix to transform to world coordinates
     # extrinsic_inv is 4x4 (note closed_form_inverse_OpenCV is batched, the output is (N, 4, 4))
@@ -84,7 +109,11 @@ def depth_to_world_coords_points(
     return world_coords_points, cam_coords_points, point_mask
 
 
-def depth_to_cam_coords_points(depth_map: np.ndarray, intrinsic: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def depth_to_cam_coords_points(
+    depth_map: np.ndarray,
+    intrinsic: np.ndarray,
+    pixel_center_offset: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Convert a depth map to camera coordinates.
 
@@ -104,7 +133,8 @@ def depth_to_cam_coords_points(depth_map: np.ndarray, intrinsic: np.ndarray) -> 
     cu, cv = intrinsic[0, 2], intrinsic[1, 2]
 
     # Generate grid of pixel coordinates
-    u, v = np.meshgrid(np.arange(W), np.arange(H))
+    off = float(pixel_center_offset)
+    u, v = np.meshgrid(np.arange(W, dtype=np.float32) + off, np.arange(H, dtype=np.float32) + off)
 
     # Unproject to camera coordinates
     x_cam = (u - cu) * depth_map / fu
