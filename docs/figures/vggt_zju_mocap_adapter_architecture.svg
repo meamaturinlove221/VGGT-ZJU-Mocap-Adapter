@@ -1,71 +1,67 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="900" viewBox="0 0 1400 900">
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="960" viewBox="0 0 1500 960">
   <defs>
-    <marker id="a" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 Z" fill="#1d4ed8"/></marker>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto"><path d="M0 0 L10 5 L0 10 Z" fill="#2563eb"/></marker>
     <style>
-      text{font-family:Inter,Arial,sans-serif;fill:#0f172a}.title{font-size:46px;font-weight:800}.sub{font-size:22px;font-style:italic;fill:#475569}.h{font-size:20px;font-weight:800}.m{font-size:15px;font-weight:700}.s{font-size:12px;fill:#475569}.n{fill:#fff;font-size:24px;font-weight:800}.box{fill:#fff;stroke-width:1.4}.panel{stroke-width:1.6}.arrow{stroke:#1d4ed8;stroke-width:3;marker-end:url(#a)}
+      text{font-family:Arial,Helvetica,sans-serif;fill:#0f172a}.title{font-size:38px;font-weight:700}.sub{font-size:18px;font-style:italic;fill:#475569}.pt{font-size:21px;font-weight:700}.ct{font-size:13px;font-weight:700}.cs{font-size:11px;fill:#475569}.num{font-size:22px;font-weight:700;fill:#fff}.box{fill:#fff;stroke-width:1.4}.arr{stroke:#2563eb;stroke-width:3;marker-end:url(#arrow)}
     </style>
   </defs>
-  <rect width="1400" height="900" fill="#fff"/>
-  <text x="700" y="62" text-anchor="middle" class="title">VGGT-ZJU-MoCap Adapter</text>
-  <text x="700" y="98" text-anchor="middle" class="sub">Dataset bridge, alignment audit, and case export for VGGT human-prior experiments</text>
+  <rect width="1500" height="960" fill="#fff"/>
+  <text x="750" y="56" text-anchor="middle" class="title">VGGT-ZJU-MoCap Adapter</text>
+  <text x="750" y="88" text-anchor="middle" class="sub">Dataset bridge, alignment audit, and case export for VGGT human-prior experiments</text>
 
-  <g transform="translate(35 130)">
-    <rect width="220" height="520" rx="18" class="panel" fill="#f0fdfa" stroke="#0f766e"/>
-    <circle cx="42" cy="38" r="22" fill="#0f766e"/><text x="42" y="46" text-anchor="middle" class="n">1</text>
-    <text x="80" y="34" class="h" fill="#0f766e">ZJU-MoCap-style</text><text x="80" y="58" class="h" fill="#0f766e">Inputs</text>
-    <g transform="translate(14 90)"><rect width="192" height="62" rx="12" class="box" stroke="#0f766e"/><rect x="18" y="18" width="44" height="28" rx="5" fill="#0f766e"/><text x="82" y="28" class="m">Multi-view</text><text x="82" y="48" class="m">RGB Frames</text></g>
-    <g transform="translate(14 172)"><rect width="192" height="62" rx="12" class="box" stroke="#0f766e"/><path d="M20 45 L48 18 L68 50 M20 45 h50" stroke="#0f766e" stroke-width="3" fill="none"/><text x="82" y="28" class="m">Camera Intrinsics</text><text x="82" y="48" class="m">/ Extrinsics</text></g>
-    <g transform="translate(14 254)"><rect width="192" height="62" rx="12" class="box" stroke="#0f766e"/><circle cx="42" cy="22" r="8" fill="#0f766e"/><path d="M42 33 v22 M27 43 h30" stroke="#0f766e" stroke-width="5" stroke-linecap="round"/><text x="82" y="28" class="m">Human / Foreground</text><text x="82" y="48" class="m">Masks</text></g>
-    <g transform="translate(14 336)"><rect width="192" height="62" rx="12" class="box" stroke="#0f766e"/><path d="M42 16 v38 M23 31 h38 M42 54 l-14 14 M42 54 l14 14" stroke="#0f766e" stroke-width="3" fill="none"/><text x="82" y="28" class="m">SMPL / SMPL-X</text><text x="82" y="48" class="m">Body Priors</text></g>
-    <g transform="translate(14 418)"><rect width="192" height="62" rx="12" class="box" stroke="#0f766e"/><path d="M25 14 h40 v42 h-40z" fill="none" stroke="#0f766e" stroke-width="4"/><text x="82" y="28" class="m">Subject / Sequence</text><text x="82" y="48" class="m">Frame Metadata</text></g>
+  <g transform="translate(30 125)">
+    <rect width="260" height="580" rx="18" fill="#eff6ff" stroke="#2563eb" stroke-width="1.8"/>
+    <circle cx="36" cy="34" r="22" fill="#2563eb"/><text x="36" y="42" text-anchor="middle" class="num">1</text>
+    <text x="78" y="35" class="pt" fill="#2563eb">ZJU-MoCap-style</text><text x="78" y="58" class="pt" fill="#2563eb">Inputs</text>
+    <g transform="translate(18 86)"><rect width="224" height="78" rx="12" class="box" stroke="#2563eb"/><rect x="18" y="24" width="44" height="28" rx="5" fill="#2563eb"/><text x="84" y="34" class="ct">Multi-view</text><text x="84" y="53" class="ct">RGB frames</text></g>
+    <g transform="translate(18 180)"><rect width="224" height="78" rx="12" class="box" stroke="#2563eb"/><line x1="18" y1="39" x2="62" y2="39" stroke="#2563eb" stroke-width="4"/><circle cx="30" cy="39" r="6" fill="#fff" stroke="#2563eb" stroke-width="3"/><text x="84" y="34" class="ct">Camera intrinsics</text><text x="84" y="53" class="ct">and extrinsics</text></g>
+    <g transform="translate(18 274)"><rect width="224" height="78" rx="12" class="box" stroke="#2563eb"/><circle cx="38" cy="39" r="14" fill="none" stroke="#2563eb" stroke-width="3"/><text x="84" y="34" class="ct">Human / foreground</text><text x="84" y="53" class="ct">masks</text></g>
+    <g transform="translate(18 368)"><rect width="224" height="78" rx="12" class="box" stroke="#2563eb"/><circle cx="38" cy="39" r="14" fill="none" stroke="#2563eb" stroke-width="3"/><text x="84" y="34" class="ct">SMPL / SMPL-X</text><text x="84" y="53" class="ct">body priors</text></g>
+    <g transform="translate(18 462)"><rect width="224" height="90" rx="12" class="box" stroke="#2563eb"/><path d="M22 18 h34 l14 14 v42 h-48z" fill="none" stroke="#2563eb" stroke-width="3"/><text x="84" y="31" class="ct">Subject, sequence,</text><text x="84" y="50" class="ct">frame metadata</text></g>
   </g>
 
-  <g transform="translate(315 130)">
-    <rect width="220" height="520" rx="18" class="panel" fill="#eff6ff" stroke="#2563eb"/>
-    <circle cx="42" cy="38" r="22" fill="#2563eb"/><text x="42" y="46" text-anchor="middle" class="n">2</text>
-    <text x="82" y="34" class="h" fill="#2563eb">Dataset Adapter</text><text x="82" y="58" class="h" fill="#2563eb">Layer</text>
-    <g transform="translate(14 90)"><rect width="192" height="62" rx="12" class="box" stroke="#2563eb"/><path d="M18 25 h22 l8 9 h42 v25 h-72z" fill="#2563eb"/><text x="82" y="28" class="m">Normalize Paths</text><text x="82" y="48" class="m">and Frame Indices</text></g>
-    <g transform="translate(14 172)"><rect width="192" height="62" rx="12" class="box" stroke="#2563eb"/><rect x="22" y="22" width="48" height="32" rx="6" fill="#2563eb"/><text x="82" y="38" class="m">Camera Audit</text></g>
-    <g transform="translate(14 254)"><rect width="192" height="62" rx="12" class="box" stroke="#2563eb"/><path d="M45 12 L70 24 v20 c0 18 -12 30 -25 38 c-13 -8 -25 -20 -25 -38 V24z" fill="#2563eb"/><text x="82" y="38" class="m">Mask Audit</text></g>
-    <g transform="translate(14 336)"><rect width="192" height="62" rx="12" class="box" stroke="#2563eb"/><path d="M45 15 v45 M25 42 h45 M45 60 l-15 10 M45 60 l15 10" stroke="#2563eb" stroke-width="3" fill="none"/><text x="82" y="25" class="m">Body-prior Alignment</text><text x="82" y="45" class="s">world / camera / image</text></g>
-    <g transform="translate(14 418)"><rect width="192" height="62" rx="12" class="box" stroke="#2563eb"/><path d="M25 22 h45 v34 h-45z M47 10 v28" stroke="#2563eb" stroke-width="4" fill="none"/><text x="82" y="28" class="m">Export VGGT-ready</text><text x="82" y="48" class="m">Case</text></g>
+  <g transform="translate(320 125)">
+    <rect width="260" height="580" rx="18" fill="#f0fdfa" stroke="#0f766e" stroke-width="1.8"/>
+    <circle cx="36" cy="34" r="22" fill="#0f766e"/><text x="36" y="42" text-anchor="middle" class="num">2</text>
+    <text x="78" y="35" class="pt" fill="#0f766e">Dataset Adapter</text><text x="78" y="58" class="pt" fill="#0f766e">Layer</text>
+    <g transform="translate(18 86)"><rect width="224" height="78" rx="12" class="box" stroke="#0f766e"/><path d="M20 22 h34 l12 12 v34 h-46z" fill="none" stroke="#0f766e" stroke-width="3"/><text x="84" y="34" class="ct">Normalize paths</text><text x="84" y="53" class="ct">and frame indices</text></g>
+    <g transform="translate(18 180)"><rect width="224" height="78" rx="12" class="box" stroke="#0f766e"/><rect x="18" y="24" width="44" height="28" rx="5" fill="#0f766e"/><text x="84" y="43" class="ct">Camera audit</text></g>
+    <g transform="translate(18 274)"><rect width="224" height="78" rx="12" class="box" stroke="#0f766e"/><circle cx="38" cy="39" r="14" fill="none" stroke="#0f766e" stroke-width="3"/><text x="84" y="43" class="ct">Mask audit</text></g>
+    <g transform="translate(18 368)"><rect width="224" height="96" rx="12" class="box" stroke="#0f766e"/><line x1="18" y1="42" x2="62" y2="42" stroke="#0f766e" stroke-width="4"/><circle cx="30" cy="42" r="6" fill="#fff" stroke="#0f766e" stroke-width="3"/><text x="84" y="31" class="ct">Body-prior</text><text x="84" y="50" class="ct">alignment</text><text x="84" y="70" class="cs">world / camera / image</text></g>
+    <g transform="translate(18 480)"><rect width="224" height="78" rx="12" class="box" stroke="#0f766e"/><path d="M22 18 h34 l14 14 v42 h-48z" fill="none" stroke="#0f766e" stroke-width="3"/><text x="84" y="34" class="ct">Export VGGT-ready</text><text x="84" y="53" class="ct">case</text></g>
   </g>
 
-  <g transform="translate(595 130)">
-    <rect width="220" height="520" rx="18" class="panel" fill="#ecfeff" stroke="#0891b2"/>
-    <circle cx="42" cy="38" r="22" fill="#0891b2"/><text x="42" y="46" text-anchor="middle" class="n">3</text>
-    <text x="82" y="34" class="h" fill="#0891b2">Diagnostics and</text><text x="82" y="58" class="h" fill="#0891b2">Controls</text>
-    <g transform="translate(14 105)"><rect width="192" height="78" rx="12" class="box" stroke="#0891b2"/><path d="M20 60 L40 20 L70 55 M30 45 h45" stroke="#0891b2" stroke-width="3" fill="none"/><text x="82" y="30" class="m">Projection Overlays</text><text x="82" y="50" class="s">diagnostic only</text></g>
-    <g transform="translate(14 213)"><rect width="192" height="78" rx="12" class="box" stroke="#0891b2"/><circle cx="28" cy="30" r="3" fill="#0891b2"/><circle cx="50" cy="55" r="3" fill="#0891b2"/><circle cx="64" cy="25" r="3" fill="#0891b2"/><text x="82" y="25" class="m">Depth / Point</text><text x="82" y="45" class="m">References</text><text x="82" y="63" class="s">teacher/reference only</text></g>
-    <g transform="translate(14 321)"><rect width="192" height="78" rx="12" class="box" stroke="#0891b2"/><line x1="20" y1="25" x2="66" y2="25" stroke="#0891b2" stroke-width="4"/><circle cx="38" cy="25" r="6" fill="#fff" stroke="#0891b2" stroke-width="4"/><text x="82" y="25" class="m">Control Packages</text><text x="82" y="45" class="s">no-prior / random</text><text x="82" y="62" class="s">shuffled / mask-only</text></g>
-    <g transform="translate(14 429)"><rect width="192" height="62" rx="12" class="box" stroke="#0891b2"/><path d="M25 12 h42 v45 h-42z" fill="none" stroke="#0891b2" stroke-width="4"/><text x="82" y="28" class="m">Source Manifest +</text><text x="82" y="48" class="m">Audit Report</text></g>
+  <g transform="translate(610 125)">
+    <rect width="260" height="580" rx="18" fill="#ecfeff" stroke="#0891b2" stroke-width="1.8"/>
+    <circle cx="36" cy="34" r="22" fill="#0891b2"/><text x="36" y="42" text-anchor="middle" class="num">3</text>
+    <text x="78" y="35" class="pt" fill="#0891b2">Diagnostics and</text><text x="78" y="58" class="pt" fill="#0891b2">Controls</text>
+    <g transform="translate(18 96)"><rect width="224" height="96" rx="12" class="box" stroke="#0891b2"/><line x1="18" y1="42" x2="62" y2="42" stroke="#0891b2" stroke-width="4"/><circle cx="30" cy="42" r="6" fill="#fff" stroke="#0891b2" stroke-width="3"/><text x="84" y="31" class="ct">Projection overlays</text><text x="84" y="50" class="cs">diagnostic only</text><text x="84" y="67" class="cs">alignment inspection</text></g>
+    <g transform="translate(18 210)"><rect width="224" height="96" rx="12" class="box" stroke="#0891b2"/><circle cx="22" cy="34" r="3" fill="#2563eb"/><circle cx="42" cy="50" r="3" fill="#06b6d4"/><circle cx="60" cy="34" r="3" fill="#f97316"/><text x="84" y="31" class="ct">Depth / point</text><text x="84" y="50" class="ct">references</text><text x="84" y="70" class="cs">teacher / reference only</text></g>
+    <g transform="translate(18 324)"><rect width="224" height="104" rx="12" class="box" stroke="#0891b2"/><line x1="18" y1="42" x2="62" y2="42" stroke="#0891b2" stroke-width="4"/><circle cx="30" cy="42" r="6" fill="#fff" stroke="#0891b2" stroke-width="3"/><text x="84" y="31" class="ct">Control packages</text><text x="84" y="50" class="cs">no-prior / random-prior</text><text x="84" y="67" class="cs">shuffled-prior / mask-only</text></g>
+    <g transform="translate(18 446)"><rect width="224" height="100" rx="12" class="box" stroke="#0891b2"/><path d="M22 18 h34 l14 14 v44 h-48z" fill="none" stroke="#0891b2" stroke-width="3"/><text x="84" y="31" class="ct">Source manifest</text><text x="84" y="50" class="ct">and audit report</text><text x="84" y="70" class="cs">records all checks</text></g>
   </g>
 
-  <g transform="translate(875 130)">
-    <rect width="220" height="520" rx="18" class="panel" fill="#f5f3ff" stroke="#3730a3"/>
-    <circle cx="42" cy="38" r="22" fill="#3730a3"/><text x="42" y="46" text-anchor="middle" class="n">4</text>
-    <text x="82" y="34" class="h" fill="#3730a3">Downstream</text><text x="82" y="58" class="h" fill="#3730a3">Consumers</text>
-    <g transform="translate(24 135)"><rect width="172" height="145" rx="14" class="box" stroke="#3730a3"/><path d="M86 30 l45 26 v52 l-45 26 l-45 -26 v-52z" fill="none" stroke="#3730a3" stroke-width="4"/><text x="86" y="95" text-anchor="middle" class="m">Vanilla</text><text x="86" y="116" text-anchor="middle" class="m">VGGT Baseline</text></g>
-    <g transform="translate(24 335)"><rect width="172" height="145" rx="14" class="box" stroke="#3730a3"/><circle cx="86" cy="45" r="26" fill="none" stroke="#3730a3" stroke-width="4"/><path d="M86 25 v50 M62 48 h48" stroke="#3730a3" stroke-width="4"/><text x="86" y="100" text-anchor="middle" class="m">VGGT-SMPL-X</text><text x="86" y="121" text-anchor="middle" class="m">Human Prior Adapter</text></g>
+  <g transform="translate(900 125)">
+    <rect width="260" height="580" rx="18" fill="#f5f3ff" stroke="#7c3aed" stroke-width="1.8"/>
+    <circle cx="36" cy="34" r="22" fill="#7c3aed"/><text x="36" y="42" text-anchor="middle" class="num">4</text>
+    <text x="78" y="35" class="pt" fill="#7c3aed">Downstream</text><text x="78" y="58" class="pt" fill="#7c3aed">Consumers</text>
+    <g transform="translate(18 140)"><rect width="224" height="120" rx="12" class="box" stroke="#7c3aed"/><rect x="18" y="34" width="44" height="28" rx="5" fill="#7c3aed"/><text x="84" y="44" class="ct">Vanilla VGGT</text><text x="84" y="63" class="ct">baseline</text></g>
+    <g transform="translate(18 310)"><rect width="224" height="140" rx="12" class="box" stroke="#7c3aed"/><circle cx="38" cy="44" r="14" fill="none" stroke="#7c3aed" stroke-width="3"/><text x="84" y="38" class="ct">VGGT-SMPL-X</text><text x="84" y="57" class="ct">human prior adapter</text><text x="84" y="78" class="cs">consumes the audited</text><text x="84" y="95" class="cs">case package</text></g>
   </g>
 
-  <g transform="translate(1155 130)">
-    <rect width="220" height="520" rx="18" class="panel" fill="#ecfdf5" stroke="#047857"/>
-    <circle cx="42" cy="38" r="22" fill="#047857"/><text x="42" y="46" text-anchor="middle" class="n">5</text>
-    <text x="82" y="34" class="h" fill="#047857">Final Evidence</text><text x="82" y="58" class="h" fill="#047857">Requirement</text>
-    <g transform="translate(24 120)"><rect width="172" height="165" rx="14" class="box" stroke="#047857"/><circle cx="45" cy="55" r="3" fill="#047857"/><circle cx="70" cy="75" r="3" fill="#1d4ed8"/><circle cx="95" cy="45" r="3" fill="#f97316"/><path d="M85 50 v50 M68 70 h34 M85 100 l-14 22 M85 100 l14 22" stroke="#111827" stroke-width="4"/><text x="86" y="125" text-anchor="middle" class="m">Human-main</text><text x="86" y="146" text-anchor="middle" class="m">Full-scene RGB</text><text x="86" y="167" text-anchor="middle" class="m">Point Cloud</text></g>
-    <g transform="translate(24 335)"><rect width="172" height="145" rx="14" class="box" stroke="#047857"/><path d="M55 30 h55 v75 h-55z" fill="none" stroke="#047857" stroke-width="4"/><rect x="68" y="78" width="10" height="20" fill="#047857"/><rect x="86" y="60" width="10" height="38" fill="#047857"/><text x="86" y="120" text-anchor="middle" class="m">Advisor-style</text><text x="86" y="141" text-anchor="middle" class="m">Comparison Report</text></g>
+  <g transform="translate(1190 125)">
+    <rect width="260" height="580" rx="18" fill="#ecfdf5" stroke="#047857" stroke-width="1.8"/>
+    <circle cx="36" cy="34" r="22" fill="#047857"/><text x="36" y="42" text-anchor="middle" class="num">5</text>
+    <text x="78" y="35" class="pt" fill="#047857">Final Evidence</text><text x="78" y="58" class="pt" fill="#047857">Requirement</text>
+    <g transform="translate(18 120)"><rect width="224" height="128" rx="12" class="box" stroke="#047857"/><circle cx="22" cy="34" r="3" fill="#2563eb"/><circle cx="42" cy="50" r="3" fill="#06b6d4"/><circle cx="60" cy="34" r="3" fill="#f97316"/><text x="84" y="31" class="ct">Human-main</text><text x="84" y="50" class="ct">full-scene RGB</text><text x="84" y="69" class="ct">point cloud</text><text x="84" y="91" class="cs">final evidence target</text></g>
+    <g transform="translate(18 300)"><rect width="224" height="120" rx="12" class="box" stroke="#047857"/><path d="M22 18 h34 l14 14 v44 h-48z" fill="none" stroke="#047857" stroke-width="3"/><text x="84" y="38" class="ct">Advisor-style</text><text x="84" y="57" class="ct">comparison report</text></g>
   </g>
 
-  <line x1="265" y1="390" x2="305" y2="390" class="arrow"/><line x1="545" y1="390" x2="585" y2="390" class="arrow"/><line x1="825" y1="390" x2="865" y2="390" class="arrow"/><line x1="1105" y1="390" x2="1145" y2="390" class="arrow"/>
+  <line x1="292" y1="415" x2="318" y2="415" class="arr"/><line x1="582" y1="415" x2="608" y2="415" class="arr"/><line x1="872" y1="415" x2="898" y2="415" class="arr"/><line x1="1162" y1="415" x2="1188" y2="415" class="arr"/>
 
-  <rect x="45" y="695" width="1310" height="135" rx="16" fill="#fbfdff" stroke="#94a3b8"/>
-  <text x="185" y="735" class="h" fill="#0f766e">Failure-Closed Policy</text>
-  <text x="185" y="764" class="m">✓ Do not train on geometrically untrusted cases</text>
-  <text x="185" y="789" class="m">✓ Teacher/reference artifacts cannot be promoted as student results</text>
-  <text x="185" y="814" class="m">✓ Projection overlays are diagnostics, not final evidence</text>
-  <line x1="680" y1="710" x2="680" y2="815" stroke="#94a3b8" stroke-dasharray="6 6"/>
-  <text x="1000" y="735" text-anchor="middle" class="h" fill="#1e3a8a">Boundary</text>
-  <text x="770" y="785" class="m" fill="#0f766e">Teacher</text><text x="910" y="785" class="m" fill="#7c3aed">Reference</text><text x="1060" y="785" class="m" fill="#1d4ed8">Baseline</text><text x="1190" y="785" class="m" fill="#047857">Student Candidate</text>
-  <text x="700" y="866" text-anchor="middle" class="s">Final evidence must come from human-main full-scene RGB point clouds and advisor-style reports; all audits are recorded before export.</text>
+  <rect x="50" y="750" width="1400" height="145" rx="18" fill="#f8fbff" stroke="#60a5fa" stroke-width="1.4"/>
+  <text x="750" y="785" text-anchor="middle" class="pt" fill="#2563eb">Failure-Closed Policy</text>
+  <text x="90" y="820" class="ct">• Do not train on geometrically untrusted cases.</text>
+  <text x="90" y="845" class="ct">• Teacher or reference artifacts cannot be promoted as student results.</text>
+  <text x="90" y="870" class="ct">• Projection overlays are diagnostics, not final evidence.</text>
 </svg>
