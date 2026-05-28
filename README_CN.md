@@ -115,67 +115,22 @@ SMPL / SMPL-X 先验需要通过同一套相机链路投影回图像。projectio
 
 ---
 
-## 导出内容
-
-一个合格的 case package 通常应该包含：
-
-- 多视角 RGB 帧；
-- 相机内参和外参；
-- human / foreground mask；
-- 可用的 SMPL 或 SMPL-X 人体先验信息；
-- 用于检查的 projection overlay；
-- 必要的 depth / point reference；
-- source manifest；
-- audit report 或 failure report。
-
-文件结构可以继续演进，但原则不能变：每个产物都要知道来源、用途和边界。
-
----
-
-## 证据边界
-
-这个项目里必须严格区分几类东西。
-
-| 类型 | 用途 | 能否当最终 student 证据 |
-| --- | --- | --- |
-| Teacher / reference | 检查几何、辅助监督、帮助定位问题 | 不能 |
-| Vanilla VGGT baseline | 后续对比基线 | 不能 |
-| Projection overlay / diagnostic | 检查相机、mask、投影是否对齐 | 不能 |
-| Student candidate | 下游模型真正吃掉 audited case 后的输出 | 只有通过视觉和对照门控后才可以 |
-
-尤其要避免一个常见误区：二维投影图里人体位置对了，并不代表三维点云就已经有人形；reference 点云更像人，也不代表 student 模型已经学会了人体拓扑。
-
-最终要看的仍然是 human-main full-scene RGB point cloud：人体是画面主体，同时保留一部分环境点，能够和 VGGT baseline / controls 在同一坐标和同一视角下比较。
-
----
-
-## failure-closed 规则
-
-如果数据没有对齐，就停止导出。
-
-这个时候最有价值的结果不是一张好看的图，而是一份清楚的失败记录，例如：
-
-```text
-camera convention mismatch
-mask and projected body prior do not overlap
-frame index cannot be traced
-resized image uses stale intrinsics
-teacher/reference artifact is being confused with student output
-```
-
-这类失败记录会让后面的实验少走弯路。数据入口已经坏了，就不应该继续训练，再用训练结果解释问题。
-
----
 
 ## 这个仓库的价值
 
-最终图当然重要，但真正让实验可信的，往往是前面这些不显眼的步骤：数据绑定、相机审计、mask 检查、先验投影、manifest、failure report、controls。
+基于ZJU-Mocap数据集的工作为我们熟悉VGGT提供了良好的台阶，让我们能尝试人体前馈先验工作提供了经验。我们遇到了很多典型的工程问题，包括但不限于：反复撞墙导致以修补人体点云空洞为优先；
 
-这个仓库的价值就在这里：它让后续 VGGT + 人体先验实验能回答一个更关键的问题：
+评价方式错误导致点云图不清晰，人体主体没有精度进步；数据集背景问题，导致VGGT在重建过程中错误识别背景与人体主体，导致人体建模不清晰等问题。真正缺的是模型表示、训练目标、局部细节生成、3D 主图评估体系。
 
-> 如果点云效果变好了，这个提升到底来自人体先验路线，还是来自更干净的数据入口、更合理的 mask，或者某个 reference 产物？
+这说明必须转向：
 
-只有数据层先说清楚，后面的模型结果才有讨论价值。
+真实 3D learned residual
+multi-view detail supervision
+baseline high-confidence detail preservation
+SMPL feature-conditioned local geometry branch
+human-main full-scene visual gate
+
+在导师建议下，我们引入了4K4D数据集和SMPL-X，在新项目取得了更好的效果。
 
 ---
 
