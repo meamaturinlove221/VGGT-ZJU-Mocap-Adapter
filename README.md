@@ -12,7 +12,8 @@
   <a href="README_CN.md">中文说明</a> ·
   <a href="#what-problem-this-repo-solves">What problem this repo solves</a> ·
   <a href="#pipeline">Pipeline</a> ·
-  <a href="#project-value">Project value</a>
+  <a href="#parallel-engineering-notes">Parallel engineering notes</a> ·
+  <a href="#current-result-snapshot">Result snapshot</a>
 </p>
 
 <p align="center">
@@ -40,9 +41,7 @@ Whether the downstream model has truly improved must be judged from a clean data
 
 ## What problem this repo solves
 
-In multi-view human reconstruction, many issues that look like model problems are eventually traced back to data binding problems.
-
-Common cases include:
+Common issues in multi-view human reconstruction include:
 
 - RGB frames and camera files do not match;
 - intrinsics are not updated after image resizing;
@@ -115,13 +114,36 @@ A case that passes the checks can enter the downstream routes: vanilla VGGT as t
 
 ---
 
-## Project value
+## Parallel engineering notes
 
-The work based on the ZJU-MoCap dataset gave us a useful stepping stone for getting familiar with VGGT, and it also gave us experience for exploring human feed-forward prior experiments. Along the way, we ran into many typical engineering problems, including but not limited to repeatedly hitting walls and gradually making human point-cloud hole filling the first priority.
+This ZJU-MoCap adaptation work was later reviewed as part of a larger parallel engineering effort. The task moved from “connecting SMPL-X to VGGT” toward a more complete sparse-view human geometry recovery loop. Several routes were made runnable, while the upper bound of 6-view head / face point-cloud quality also became clearer.
 
-There were also problems in the evaluation method: the point-cloud figures were not clear enough, and the human subject did not show real precision improvement. Dataset background issues also caused VGGT to confuse the background with the human subject during reconstruction, making the human modeling less clear. What was really missing was a model representation, a training objective, local detail generation, and a 3D main-figure evaluation system.
+The main chain can be summarized in four layers:
 
-This means the route must move toward:
+1. **Pose-aligned SMPL-X driver**: read pose / shape / expression / translation / scale, and place the parametric body into the current pose and scene coordinate system.
+2. **Dense prior maps**: project the posed mesh into real cameras and generate view-aligned dense priors, including depth, camera/world points, normals, visibility, canonical coordinates, and body-part features.
+3. **Input-side / layer-wise fusion**: RGB keeps real appearance and scene context; prior maps provide pose-aligned geometric positions; masks restrict where the human prior should take effect. The prior is not only concatenated once at the input side, but also participates during multi-layer feature evolution.
+4. **Output-side supervision**: the training side supports depth / point / normal / point-normal geometric supervision, with ROI and boundary weighting.
+
+The role of SMPL / SMPL-X here is not to serve as the final result. It is a pose-aligned geometry prior that provides coarse body position, depth, surface direction, and region constraints. The real question is still whether the downstream model can generate a clearer, more continuous, and more stable 3D human point cloud under sparse-view conditions.
+
+This stage also made one lesson clear: adding more losses or increasing ROI point count does not automatically mean better geometry. If the teacher is not continuous, aligned, and complete enough on visible surfaces, the result can easily become a pseudo-positive case where point count increases but Open3D evaluation becomes worse.
+
+---
+
+## Checked routes and failure boundaries
+
+The parallel experiments checked several directions:
+
+- projected targetpatch / summary-token patch;
+- point-normal / humancrop finetuning from the same checkpoint;
+- TeacherGeom / ROI combo;
+- confidence-collapse pseudo-positive cases, where face ROI point count increases but confidence thresholding or Open3D evaluation shows worse geometry;
+- external teacher routes such as NormalBae, Sapiens, DepthAnything, and DepthPro.
+
+The conclusion is fairly clear: the current bottleneck is not a lack of scripts. It is the lack of a high-quality, continuous, aligned head / face geometry teacher, or the lack of a local geometry optimization method that can directly improve sparse-view target-view surfaces.
+
+The next route therefore has to move toward harder components:
 
 - real 3D learned residual;
 - multi-view detail supervision;
@@ -129,7 +151,33 @@ This means the route must move toward:
 - SMPL feature-conditioned local geometry branch;
 - human-main full-scene visual gate.
 
-Following the advisor's suggestion, we introduced the 4K4D dataset and SMPL-X, and achieved better results in the new project.
+---
+
+## Current result snapshot
+
+<p align="center">
+  <img src="docs/figures/yuque_parallel_face_head_results.svg" alt="6-view face/head ROI result grid" width="72%" />
+</p>
+
+<p align="center"><sub>6-view face/head ROI re-audit: local facial structure is visible, but continuity and stability are still not enough.</sub></p>
+
+<p align="center">
+  <img src="docs/figures/yuque_kinect_fusion_control_grid.svg" alt="Kinect direct fusion control grid" width="100%" />
+</p>
+
+<p align="center"><sub>Kinect direct fusion conservative-parameter control: recorded as an external geometry route check, not as student output.</sub></p>
+
+The safe conclusion at this point is that the 6-view setting has produced promising local facial results, but flaws remain. Under the same protocol, the 6-view face / head point cloud has not yet reached the final requirement of being clear, continuous, and stable enough.
+
+---
+
+## Project value
+
+The work based on the ZJU-MoCap dataset gave us a useful stepping stone for getting familiar with VGGT and exploring human feed-forward priors. It exposed many engineering issues that are easy to miss: data binding, background interference, camera-chain reliability, mask quality, diagnostic-figure misjudgment, and the evaluation method for 3D main figures.
+
+These issues pushed the later route change. What was missing was not a single script, but a more reliable model representation, training objective, local detail generation path, and 3D main-figure evaluation system.
+
+Following the advisor's suggestion, later work introduced the 4K4D dataset and SMPL-X, and moved toward a more complete VGGT + SMPL-X human-prior experiment stack.
 
 ---
 
@@ -137,7 +185,7 @@ Following the advisor's suggestion, we introduced the 4K4D dataset and SMPL-X, a
 
 This repository is currently positioned as a research utility / dataset bridge, not as a final point-cloud reconstruction benchmark.
 
-The current focus is to make ZJU-MoCap-style cases auditable and reusable, and to let them enter the more complete VGGT + SMPL-X human-prior experiment stack.
+The current focus is to make ZJU-MoCap-style cases auditable and reusable, while keeping the parallel engineering records, result snapshots, and failure boundaries visible.
 
 ---
 
@@ -147,10 +195,12 @@ This repository is designed around local ZJU-MoCap-style data and human model as
 
 ---
 
-## Architecture figure
+## Architecture figure and added figures
 
-The architecture figure is stored at:
+The architecture figure and the newly added supporting figures are stored at:
 
 ```text
 docs/figures/vggt_zju_mocap_adapter_architecture.svg
+docs/figures/yuque_parallel_face_head_results.svg
+docs/figures/yuque_kinect_fusion_control_grid.svg
 ```
