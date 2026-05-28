@@ -1,7 +1,7 @@
-<h1 align="center">VGGT-ZJU-MoCap Adapter</h1>
+# VGGT-ZJU-MoCap Adapter
 
 <p align="center">
-  <b>A dataset bridge for running VGGT-style human-prior experiments on ZJU-MoCap cases.</b>
+  <b>A VGGT human-prior experiment data bridge for ZJU-MoCap-style data.</b>
 </p>
 
 <p align="center">
@@ -10,9 +10,9 @@
 
 <p align="center">
   <a href="README_CN.md">中文说明</a> ·
-  <a href="#why-this-repo-exists">Why</a> ·
+  <a href="#what-problem-this-repo-solves">What problem this repo solves</a> ·
   <a href="#pipeline">Pipeline</a> ·
-  <a href="#evidence-boundary">Evidence Boundary</a>
+  <a href="#project-value">Project value</a>
 </p>
 
 <p align="center">
@@ -32,41 +32,42 @@
 
 `VGGT-ZJU-MoCap-Adapter` is the data reliability layer of the VGGT + human-prior project.
 
-The job of this repository is simple and strict: turn a ZJU-MoCap-style case into a VGGT-ready package whose cameras, frames, masks, and body-prior projections can be trusted before any downstream model claims an improvement.
+It does not package final results, and it does not treat diagnostic figures as achievements. This repository does one thing: it organizes ZJU-MoCap-style data into a trusted case that can be consumed by VGGT or a human-prior branch, while making the key parts clear: cameras, frame indices, masks, and body-prior projections.
 
-It does not try to be the final reconstruction model. It prepares the case, writes the evidence, and makes later comparison work less ambiguous.
-
----
-
-## Why this repo exists
-
-In multi-view human reconstruction, many failures look like model failures at first glance.
-
-In practice, the real cause is often earlier in the chain:
-
-- RGB frames and camera files are not bound to the same frame.
-- Intrinsics are used after resizing without being updated.
-- World-to-camera and camera-to-world conventions are mixed.
-- Human masks keep too much background or cut away body parts.
-- SMPL / SMPL-X priors project to the wrong place.
-- A teacher/reference artifact is later mistaken for a student model output.
-
-This repository keeps those problems visible. If the case is not geometrically reliable, it should fail at the data layer instead of being silently pushed into training.
+Whether the downstream model has truly improved must be judged from a clean data entry point. This repository handles that entry point.
 
 ---
 
-## Where it sits in the project
+## What problem this repo solves
+
+In multi-view human reconstruction, many issues that look like model problems are eventually traced back to data binding problems.
+
+Common cases include:
+
+- RGB frames and camera files do not match;
+- intrinsics are not updated after image resizing;
+- world-to-camera and camera-to-world conventions are mixed;
+- unstable mask boundaries affect the human region and scene context;
+- SMPL / SMPL-X priors are projected to the wrong image location;
+- teacher/reference artifacts are mistaken for student model outputs;
+- projection overlays look correct, while the 3D point cloud still has not formed a reliable human shape.
+
+This repository exposes these issues early. If the data layer is not trustworthy, the pipeline should stop here instead of continuing training, taking more screenshots, and pushing the problem further downstream.
+
+---
+
+## Project position
 
 ```text
 ZJU-MoCap-style data
         │
         ▼
 VGGT-ZJU-MoCap-Adapter
-  ├─ frame / path normalization
-  ├─ camera audit
+  ├─ path and frame-index normalization
+  ├─ camera-parameter audit
   ├─ mask audit
   ├─ body-prior projection check
-  ├─ diagnostics and controls
+  ├─ diagnostic figures and control packages
   └─ VGGT-ready case package
         │
         ├─ vanilla VGGT baseline
@@ -77,10 +78,12 @@ VGGT-ZJU-MoCap-Adapter
       human-main full-scene RGB point-cloud evidence
 ```
 
-Related routes:
+Relation to other repositories:
 
-- `VGGT-SMPL-X-Human-Prior-Adapter`: model-side prior injection and training route.
-- `vggt_for_4k_4d`: full-scene evidence organization and report-side comparison route.
+- `VGGT-SMPL-X-Human-Prior-Adapter`: the model-side route for human-prior injection and training.
+- `vggt_for_4k_4d`: the route for full-scene evidence, control results, and report-side comparisons.
+
+This repository sits earlier in the chain. Its role is to turn ZJU-MoCap-style data into an input that can actually be discussed.
 
 ---
 
@@ -88,114 +91,66 @@ Related routes:
 
 ### 1. Collect the case
 
-The adapter starts from a ZJU-MoCap-style case: multi-view RGB frames, camera parameters, masks, subject metadata, and available body-prior annotations.
+The input usually contains multi-view RGB, camera parameters, masks, subject / sequence / frame information, and available SMPL or SMPL-X human-prior data.
 
-### 2. Normalize frame binding
+### 2. Normalize frame indices and paths
 
-The first pass makes the case explicit: subject, sequence, camera id, frame id, file path, and image size should be traceable from the exported manifest.
+Every exported sample should be traceable back to its original subject, sequence, camera id, frame id, and file path. The worst case here is that the pipeline runs, but no one can tell which frame was actually used.
 
-### 3. Audit cameras
+### 3. Check cameras
 
-The camera layer checks whether intrinsics and extrinsics match the exported image size and the chosen coordinate convention. The output should make it clear which transform is used and where it is used.
+Camera parameters are the foundation of multi-view geometry. Before export, intrinsics, extrinsics, coordinate conventions, image size, and resizing relationships need to be explicit. If this part is wrong, projection, depth, and point clouds will all be wrong afterward.
 
-### 4. Audit masks
+### 4. Check masks
 
-Masks are treated as geometry inputs, not decoration. A bad mask can make a correct prior look wrong or make a wrong prior look plausible. The export should keep mask diagnostics available for later review.
+Masks are not decorative images. They affect the human region, background retention, projection checks, and downstream supervision. If the mask itself is unreliable, even a visually pleasing model result should be treated carefully.
 
-### 5. Align body priors
+### 5. Align the human prior
 
-SMPL / SMPL-X priors are projected through the audited camera path. Projection overlays are used here as diagnostics: they help check alignment, but they are not final reconstruction evidence.
+SMPL / SMPL-X priors need to be projected back to the image through the same camera chain. Projection overlays are only used here as diagnostic figures to check whether the prior lands in a reasonable place. They cannot replace final 3D point-cloud evidence.
 
-### 6. Export a VGGT-ready package
+### 6. Export the VGGT-ready package
 
-A clean case package can be passed to vanilla VGGT as a baseline or to the downstream human-prior adapter for model-side experiments.
-
----
-
-## Output package
-
-A typical export is expected to contain:
-
-- multi-view RGB frames;
-- camera intrinsics and extrinsics;
-- human / foreground masks;
-- SMPL or SMPL-X body-prior data when available;
-- projection overlays for inspection;
-- reference depth / point artifacts when needed;
-- source manifests;
-- audit and failure reports.
-
-The exact file layout can evolve, but the rule should stay the same: every exported artifact must have a source and a reason to exist.
+A case that passes the checks can enter the downstream routes: vanilla VGGT as the baseline, and the VGGT-SMPL-X human-prior branch for model-side experiments.
 
 ---
 
-## Evidence boundary
+## Project value
 
-This repository uses a strict boundary between four kinds of artifacts.
+The work based on the ZJU-MoCap dataset gave us a useful stepping stone for getting familiar with VGGT, and it also gave us experience for exploring human feed-forward prior experiments. Along the way, we ran into many typical engineering problems, including but not limited to repeatedly hitting walls and gradually making human point-cloud hole filling the first priority.
 
-| Artifact type | Role | Can be used as final student evidence? |
-| --- | --- | --- |
-| Teacher / reference | Checks geometry and provides supervision clues | No |
-| Vanilla VGGT baseline | Baseline comparison | No |
-| Diagnostics | Finds camera, mask, or projection problems | No |
-| Student candidate | Downstream model output after consuming the audited case | Only if it passes visual and comparison gates |
+There were also problems in the evaluation method: the point-cloud figures were not clear enough, and the human subject did not show real precision improvement. Dataset background issues also caused VGGT to confuse the background with the human subject during reconstruction, making the human modeling less clear. What was really missing was a model representation, a training objective, local detail generation, and a 3D main-figure evaluation system.
 
-A projection overlay can prove that a prior lands in the right image region. It cannot prove that the 3D point cloud is good.
+This means the route must move toward:
 
-A depth or point reference can help debug the case. It cannot be promoted as the model result.
+- real 3D learned residual;
+- multi-view detail supervision;
+- baseline high-confidence detail preservation;
+- SMPL feature-conditioned local geometry branch;
+- human-main full-scene visual gate.
 
-The final target remains a human-main, full-scene RGB point cloud: the person should be the subject of the view, and enough environment should remain to prove that the result still lives in the scene rather than in an isolated crop.
-
----
-
-## Failure-closed rule
-
-If the case does not pass alignment checks, the pipeline should stop.
-
-The correct output in that situation is not a polished figure. It is a short failure note that records what broke:
-
-```text
-camera convention mismatch
-mask and projected body prior do not overlap
-frame index cannot be traced
-resized image uses stale intrinsics
-teacher/reference artifact is being confused with student output
-```
-
-Failing early is useful. It protects the downstream experiment from spending hours on a case that was already broken before training began.
-
----
-
-## What makes this useful
-
-This repository is built for the part of research that usually gets hidden in a short paper paragraph: data binding, audits, failed cases, controls, and evidence packaging.
-
-It is useful when the goal is not only to run a demo, but to answer a harder question:
-
-> If the model improves, can we prove that the improvement came from the intended human-prior route rather than from a cleaner crop, a lucky mask, or a reference artifact?
-
-That is the purpose of the adapter.
+Following the advisor's suggestion, we introduced the 4K4D dataset and SMPL-X, and achieved better results in the new project.
 
 ---
 
 ## Current status
 
-This repository should be read as a research utility and dataset-bridge route. It is not presented as a final point-cloud reconstruction benchmark.
+This repository is currently positioned as a research utility / dataset bridge, not as a final point-cloud reconstruction benchmark.
 
-The current focus is to make ZJU-MoCap-style cases auditable and reusable inside the wider VGGT + SMPL-X experiment stack.
+The current focus is to make ZJU-MoCap-style cases auditable and reusable, and to let them enter the more complete VGGT + SMPL-X human-prior experiment stack.
 
 ---
 
-## Figure
+## Data note
+
+This repository is designed around local ZJU-MoCap-style data and human model assets. Restricted datasets, RGB frames, masks, camera files, and SMPL/SMPL-X body model files should not be placed directly in the public repository unless their licenses explicitly allow redistribution.
+
+---
+
+## Architecture figure
 
 The architecture figure is stored at:
 
 ```text
 docs/figures/vggt_zju_mocap_adapter_architecture.svg
 ```
-
----
-
-## Data note
-
-This repository is designed to work around ZJU-MoCap-style local data and body-prior assets. Restricted datasets, private RGB frames, masks, camera files, and body model files should stay outside the public repository unless their license explicitly allows redistribution.
